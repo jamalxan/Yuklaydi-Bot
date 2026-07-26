@@ -77,7 +77,11 @@ async def cb_lyrics(callback: CallbackQuery, user_lang: str):
         await callback.answer()
         return
 
-    page = int(parts[1])
+    try:
+        page = int(parts[1])
+    except ValueError:
+        await callback.answer()
+        return
     song_key = parts[2]
     lang = user_lang or "en"
 
@@ -96,7 +100,7 @@ async def cb_lyrics(callback: CallbackQuery, user_lang: str):
 
     pages = paginate_lyrics(lyrics)
     total = len(pages)
-    page = min(page, total - 1)
+    page = max(0, min(page, total - 1))
 
     header = f"📜 <b>{title}</b> — {artist}\n"
     if total > 1:

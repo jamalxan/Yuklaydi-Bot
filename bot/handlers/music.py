@@ -94,7 +94,11 @@ async def cb_music_page(callback: CallbackQuery, user_lang: str):
         await callback.answer()
         return
 
-    qhash, page = parts[1], int(parts[2])
+    try:
+        qhash, page = parts[1], int(parts[2])
+    except ValueError:
+        await callback.answer()
+        return
     lang = user_lang or "en"
 
     raw = await get_music_search_by_hash(qhash)
@@ -104,7 +108,7 @@ async def cb_music_page(callback: CallbackQuery, user_lang: str):
 
     entries = [SongEntry(**e) for e in raw]
     total_pages = max(1, math.ceil(len(entries) / 10))
-    page = min(page, total_pages - 1)
+    page = max(0, min(page, total_pages - 1))
 
     text, kb = music_search_keyboard(qhash, entries, page=page, total_pages=total_pages, lang=lang)
     header = _MSGS["results"].get(lang, "🎵 <b>Results:</b>")
@@ -122,7 +126,11 @@ async def cb_music_pick(callback: CallbackQuery, user_lang: str):
         await callback.answer()
         return
 
-    qhash, idx = parts[1], int(parts[2])
+    try:
+        qhash, idx = parts[1], int(parts[2])
+    except ValueError:
+        await callback.answer()
+        return
     lang = user_lang or "en"
 
     raw = await get_music_search_by_hash(qhash)
@@ -131,7 +139,7 @@ async def cb_music_pick(callback: CallbackQuery, user_lang: str):
         return
 
     entries = [SongEntry(**e) for e in raw]
-    if idx >= len(entries):
+    if not 0 <= idx < len(entries):
         await callback.answer("Invalid", show_alert=True)
         return
 

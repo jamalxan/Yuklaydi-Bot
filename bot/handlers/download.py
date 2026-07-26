@@ -15,7 +15,7 @@ from bot.services.cache import (
     get_url_by_key, get_video_for_shazam,
     store_url_key, store_video_for_shazam,
 )
-from bot.services.downloader import detect_platform, normalize_url
+from bot.services.downloader import detect_platform, has_cookies, normalize_url
 
 router = Router()
 
@@ -37,6 +37,11 @@ _ERR = {
     "unsupported": {"uz": "❌ Ushbu havola qo'llab-quvvatlanmaydi.", "ru": "❌ Эта ссылка не поддерживается.", "en": "❌ This link is not supported."},
     "generic":     {"uz": "❌ Yuklab olishda xatolik. Keyinroq urinib ko'ring.", "ru": "❌ Ошибка при скачивании. Попробуйте позже.", "en": "❌ Download failed. Please try again later."},
     "overloaded":  {"uz": "🔄 Hozir server band. Bir oz kuting.", "ru": "🔄 Сервер перегружен. Попробуйте позже.", "en": "🔄 Server overloaded. Please try again shortly."},
+    "ig_disabled": {
+        "uz": "📷 Instagram yuklab olish hozircha texnik sozlashda. Tez orada ishga tushadi.\n💡 Hozircha YouTube havolalarini yuborishingiz mumkin.",
+        "ru": "📷 Скачивание из Instagram пока настраивается. Скоро заработает.\n💡 Пока можно отправлять ссылки YouTube.",
+        "en": "📷 Instagram downloads are being set up. Coming soon.\n💡 Meanwhile you can send YouTube links.",
+    },
 }
 
 
@@ -79,6 +84,21 @@ async def handle_url(message: Message, user_lang: str, user_repo: UserRepo, down
     lang = user_lang or "en"
     platform = detect_platform(url)
     normalized = normalize_url(url)
+
+    # Only known platforms are downloadable. Passing arbitrary URLs to
+    # yt-dlp's generic extractor would let anyone make the server fetch
+    # internal/private addresses (SSRF) and waste workers on dead links.
+    if platform is None:
+        await message.answer(_ERR["unsupported"].get(lang, _ERR["unsupported"]["en"]))
+        return
+
+    # Instagram is login-gated platform-wide: without cookies every attempt
+    # burns ~30s of worker time and fails. Fail fast with an honest message.
+    if platform == "instagram" and not has_cookies():
+        logger.warning("Instagram request rejected: no cookies configured "
+                       "(set COOKIES_FILE or COOKIES_FROM_BROWSER)")
+        await message.answer(_ERR["ig_disabled"].get(lang, _ERR["ig_disabled"]["en"]))
+        return
 
     # Cache hit → instant send, no worker needed
     cached_id = await get_file_id(normalized, "720")

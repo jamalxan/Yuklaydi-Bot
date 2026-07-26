@@ -111,10 +111,14 @@ _NOT_FOUND = {
 def _make_bot() -> Bot:
     from aiogram.client.default import DefaultBotProperties
     from aiogram.enums import ParseMode
+    # Workers upload multi-MB (up to 2GB via local API) files — the default
+    # 60s request timeout aborts slow uploads with "Request timeout error".
+    upload_timeout = max(300, settings.job_timeout)
     session = (
-        AiohttpSession(api=TelegramAPIServer.from_base(settings.local_api_url, is_local=True))
+        AiohttpSession(api=TelegramAPIServer.from_base(settings.local_api_url, is_local=True),
+                       timeout=upload_timeout)
         if settings.use_local_api
-        else AiohttpSession()
+        else AiohttpSession(timeout=upload_timeout)
     )
     return Bot(token=settings.bot_token, session=session,
                default=DefaultBotProperties(parse_mode=ParseMode.HTML))

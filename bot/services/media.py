@@ -133,11 +133,24 @@ async def extract_audio_snippet(
 
 
 def safe_delete(path: str) -> None:
-    try:
-        if path and os.path.exists(path):
-            os.remove(path)
-    except Exception as e:
-        logger.warning(f"Failed to delete temp file {path}: {e}")
+    if not path:
+        return
+    # On Windows a just-uploaded file can still be held by the HTTP client for
+    # a moment (WinError 32) — retry briefly before giving up. Leftovers are
+    # swept by the hourly cleanup task either way.
+    import time
+    for attempt in range(3):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        except PermissionError:
+            if attempt < 2:
+                time.sleep(0.4)
+        except Exception as e:
+            logger.warning(f"Failed to delete temp file {path}: {e}")
+            return
+    logger.warning(f"Temp file still locked, leaving for cleanup task: {path}")
 
 
 async def cleanup_old_files(directory: str, max_age_seconds: int = 3600) -> None:

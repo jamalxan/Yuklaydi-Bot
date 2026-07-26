@@ -216,3 +216,63 @@ def test_safe_delete_no_crash_on_empty_string():
     from bot.services.media import safe_delete
     safe_delete("")
     safe_delete(None)  # type: ignore
+
+
+# ── Unknown-platform URLs are rejected (SSRF guard) ───────────────────────────
+
+@pytest.mark.asyncio
+async def test_unknown_platform_url_rejected():
+    """URLs outside SUPPORTED_PLATFORMS must be answered 'unsupported', not enqueued."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from bot.handlers.download import handle_url
+
+    for bad in [
+        "http://169.254.169.254/latest/meta-data/",   # cloud metadata SSRF
+        "http://localhost:8081/secret",
+        "http://192.168.1.1/admin",
+        "https://random-unknown-site.example/video.mp4",
+    ]:
+        msg = MagicMock()
+        msg.text = bad
+        msg.from_user = MagicMock(); msg.from_user.id = 1
+        msg.chat = MagicMock(); msg.chat.id = 1
+        msg.answer = AsyncMock()
+        msg.bot = AsyncMock()
+
+        with patch("bot.handlers.download._enqueue_download", new=AsyncMock()) as enq:
+            await handle_url(msg, user_lang="en", user_repo=AsyncMock(), download_repo=AsyncMock())
+            assert not enq.called, f"{bad} must NOT be enqueued"
+        msg.answer.assert_called_once()
+
+
+# ── Malformed callback data must not raise ────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_lyrics_callback_garbage_page():
+    from unittest.mock import AsyncMock, MagicMock
+    from bot.handlers.shazam import cb_lyrics
+
+    cb = MagicMock()
+    cb.data = "lyrics:NOTANUMBER:abc123"
+    cb.answer = AsyncMock()
+    cb.message = AsyncMock()
+    await cb_lyrics(cb, user_lang="en")   # must not raise
+    cb.answer.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_music_pick_garbage_and_negative_index():
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from bot.handlers.music import cb_music_pick
+
+    for data in ["ms:h:xx", "ms:h:-1", "ms:h:999"]:
+        cb = MagicMock()
+        cb.data = data
+        cb.answer = AsyncMock()
+        cb.message = AsyncMock()
+        with patch("bot.handlers.music.get_music_search_by_hash",
+                   new=AsyncMock(return_value=[{"id": "a", "title": "t", "uploader": "u",
+                                                "duration": 1, "url": "https://youtu.be/a",
+                                                "thumbnail": None}])):
+            await cb_music_pick(cb, user_lang="en")   # must not raise
+        cb.answer.assert_called()

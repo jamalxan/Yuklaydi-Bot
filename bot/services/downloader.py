@@ -123,6 +123,11 @@ def cookies_path() -> Optional[str]:
     return path if path and os.path.exists(path) else None
 
 
+def has_cookies() -> bool:
+    """True if any cookie source is configured (file or browser profile)."""
+    return bool(cookies_path() or settings.cookies_from_browser)
+
+
 def youtube_extractor_args() -> dict:
     # Multiple clients: if one gets bot-checked, yt-dlp tries the next.
     return {"youtube": {"player_client": ["android", "web_safari", "web"]}}
