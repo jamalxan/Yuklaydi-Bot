@@ -96,6 +96,7 @@ _ERR = {
     "unsupported": {"uz": "❌ Ushbu havola qo'llab-quvvatlanmaydi.", "ru": "❌ Эта ссылка не поддерживается.", "en": "❌ This link is not supported."},
     "no_video":    {"uz": "📷 Bu postda video yo'q yoki Instagram login talab qilmoqda.\n💡 Reel havolasini yuboring: instagram.com/reel/...", "ru": "📷 В этом посте нет видео или Instagram требует авторизацию.\n💡 Попробуйте ссылку на Reel: instagram.com/reel/...", "en": "📷 No video in this post or Instagram requires login.\n💡 Try a Reel link: instagram.com/reel/..."},
     "timeout":     {"uz": "⏱ Server bilan aloqa yo'q. Keyinroq urinib ko'ring.", "ru": "⏱ Нет связи с сервером. Попробуйте позже.", "en": "⏱ Connection timed out. Please try again later."},
+    "bot_check":   {"uz": "🤖 YouTube tekshiruvi tufayli yuklab bo'lmadi. Birozdan so'ng qayta urinib ko'ring.", "ru": "🤖 YouTube требует проверку. Попробуйте чуть позже.", "en": "🤖 YouTube bot-check hit. Please try again in a bit."},
     "generic":     {"uz": "❌ Yuklab olishda xatolik.", "ru": "❌ Ошибка при скачивании.", "en": "❌ Download failed. Please try again later."},
     "too_large":   {"uz": f"📦 Fayl juda katta (maks {settings.max_file_mb}MB).", "ru": f"📦 Файл слишком большой (макс {settings.max_file_mb}МБ).", "en": f"📦 File too large (max {settings.max_file_mb}MB)."},
 }
@@ -119,6 +120,31 @@ def _make_bot() -> Bot:
                default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
 
+def _get_bot(ctx: dict) -> Bot:
+    """Reuse the worker-process Bot (one aiohttp session per process).
+
+    Creating a Bot + TCP session per job is pure churn at high job rates.
+    Falls back to a fresh bot if the worker startup hook didn't run (tests).
+    """
+    bot = ctx.get("bot") if isinstance(ctx, dict) else None
+    return bot if bot is not None else _make_bot()
+
+
+async def worker_startup(ctx: dict) -> None:
+    ctx["bot"] = _make_bot()
+    logger.info("Worker startup: shared Bot session created")
+
+
+async def worker_shutdown(ctx: dict) -> None:
+    bot = ctx.pop("bot", None)
+    if bot is not None:
+        try:
+            await bot.session.close()
+        except Exception:
+            pass
+    logger.info("Worker shutdown: Bot session closed")
+
+
 async def _safe_edit(bot: Bot, chat_id: int, message_id: int, text: str, **kwargs) -> None:
     try:
         await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, **kwargs)
@@ -135,12 +161,31 @@ def _log_timing(event: str, **fields) -> None:
     logger.info(json.dumps({"event": event, **fields}))
 
 
+async def _send_cached(bot: Bot, chat_id: int, message_id: int,
+                       url: str, quality: str, file_id: str, lang: str) -> None:
+    """Send a cached file_id and clean up the progress message."""
+    shazam_key = await store_video_for_shazam(file_id, source_url=url)
+    url_key = await store_url_key(url)
+    from bot.keyboards.inline import video_result_keyboard
+    kb = video_result_keyboard(url_key, shazam_key, lang)
+    if quality == "mp3":
+        await bot.send_audio(chat_id, audio=file_id, caption="🤖 @vidyuklaydi_bot")
+    else:
+        await bot.send_video(chat_id, video=file_id, caption="🤖 @vidyuklaydi_bot",
+                             supports_streaming=True, reply_markup=kb)
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+
 async def download_task(
     ctx: dict, *,
     user_id: int, chat_id: int, message_id: int,
     url: str, platform: str, quality: str, user_lang: str,
 ):
-    bot = _make_bot()
+    bot = _get_bot(ctx)
+    own_bot = bot is not ctx.get("bot")
     temp_path: Optional[str] = None
     lang = user_lang or "en"
     t_total_start = time.monotonic()
@@ -150,39 +195,42 @@ async def download_task(
     await acquire_user_slot(user_id)
 
     try:
+        # ── Fast path: the job may have waited in a deep queue while another
+        # job for the same URL finished — serve straight from cache.
+        cached = await get_file_id(url, quality)
+        if cached:
+            await _send_cached(bot, chat_id, message_id, url, quality, cached, lang)
+            _log_timing("download_complete", platform=platform, quality=quality,
+                        t_extract=0, t_download=0, t_upload=0,
+                        t_total=round(time.monotonic() - t_total_start, 2),
+                        from_cache=True, single_flight=False, local_api=settings.use_local_api)
+            return
+
         suffix = ".mp3" if quality == "mp3" else ".mp4"
         temp_path = get_temp_path(suffix=suffix)
 
         await _safe_edit(bot, chat_id, message_id, _DL["downloading"].get(lang, "⏳ Downloading..."))
 
         # ── Single-flight: prevent duplicate concurrent downloads of same URL ──
-        # If another worker is downloading this URL+quality, wait up to job_timeout
-        # for the cache key to appear and serve from cache; else download ourselves.
+        # If another worker is downloading this URL+quality, wait a bounded
+        # time for the cache key to appear; else download ourselves. The wait
+        # MUST stay well under job_timeout or arq kills the job before the
+        # fallback download can run.
         sf_acquired = await acquire_single_flight(url, quality, ttl=settings.job_timeout)
         if not sf_acquired:
-            # Wait for the concurrent download to populate cache
             file_id_from_flight: Optional[str] = None
-            for _ in range(settings.job_timeout):
-                await asyncio.sleep(1)
+            wait_budget = max(10, min(settings.single_flight_wait, settings.job_timeout // 3))
+            waited = 0.0
+            while waited < wait_budget:
+                await asyncio.sleep(2)
+                waited += 2
                 file_id_from_flight = await get_file_id(url, quality)
                 if file_id_from_flight:
                     break
 
             if file_id_from_flight:
                 # Serve from cache populated by the other worker
-                shazam_key = await store_video_for_shazam(file_id_from_flight, source_url=url)
-                url_key = await store_url_key(url)
-                from bot.keyboards.inline import video_result_keyboard
-                kb = video_result_keyboard(url_key, shazam_key, lang)
-                if quality == "mp3":
-                    await bot.send_audio(chat_id, audio=file_id_from_flight, caption="🤖 @vidyuklaydi_bot")
-                else:
-                    await bot.send_video(chat_id, video=file_id_from_flight, caption="🤖 @vidyuklaydi_bot",
-                                         supports_streaming=True, reply_markup=kb)
-                try:
-                    await bot.delete_message(chat_id, message_id)
-                except Exception:
-                    pass
+                await _send_cached(bot, chat_id, message_id, url, quality, file_id_from_flight, lang)
                 _log_timing("download_complete", platform=platform, quality=quality,
                             t_extract=0, t_download=0, t_upload=0,
                             t_total=round(time.monotonic() - t_total_start, 2),
@@ -317,7 +365,8 @@ async def download_task(
         if sf_acquired:
             await release_single_flight(url, quality)
         await release_user_slot(user_id)
-        await bot.session.close()
+        if own_bot:
+            await bot.session.close()
 
 
 async def _download_for_recognize(bot: Bot, file_id: str, file_suffix: str,
@@ -369,7 +418,8 @@ async def recognize_task(
     file_id: str, file_suffix: str, user_lang: str,
     source_url: str = "",
 ):
-    bot = _make_bot()
+    bot = _get_bot(ctx)
+    own_bot = bot is not ctx.get("bot")
     temp_path: Optional[str] = None
     lang = user_lang or "en"
 
@@ -444,7 +494,8 @@ async def recognize_task(
     finally:
         if temp_path:
             safe_delete(temp_path)
-        await bot.session.close()
+        if own_bot:
+            await bot.session.close()
 
 
 async def music_download_task(
@@ -453,7 +504,8 @@ async def music_download_task(
     video_id: str, url: str, title: str, artist: str,
     duration: int = 0, thumbnail: Optional[str] = None, user_lang: str = "en",
 ):
-    bot = _make_bot()
+    bot = _get_bot(ctx)
+    own_bot = bot is not ctx.get("bot")
     temp_audio: Optional[str] = None
     temp_thumb: Optional[str] = None
     lang = user_lang or "en"
@@ -463,9 +515,25 @@ async def music_download_task(
                          {"uz": "⏳ Yuklanmoqda...", "ru": "⏳ Скачивается...", "en": "⏳ Downloading..."}.get(lang, "⏳"))
         await bot.send_chat_action(chat_id, "upload_voice")
 
+        # Check audio cache first — job may have queued behind an identical one
+        from bot.services.cache import get_audio_file_id
+        cached_audio = await get_audio_file_id(video_id)
+        if cached_audio:
+            from bot.keyboards.inline import audio_result_keyboard
+            song_key = await store_song_meta(title, artist)
+            await bot.send_audio(chat_id, audio=cached_audio, caption="🤖 @vidyuklaydi_bot",
+                                 reply_markup=audio_result_keyboard(song_key, lang))
+            try:
+                await bot.delete_message(chat_id, message_id)
+            except Exception:
+                pass
+            return
+
         temp_audio = get_temp_path(suffix=".mp3", prefix="mus_")
         from bot.services.music_search import download_audio
-        await download_audio(url, temp_audio)
+        # Same per-process yt-dlp concurrency guard as video downloads
+        async with _get_yt_dlp_sem():
+            await download_audio(url, temp_audio)
 
         if not os.path.exists(temp_audio):
             raise RuntimeError("Audio file missing after download")
@@ -538,7 +606,8 @@ async def music_download_task(
             safe_delete(temp_audio)
         if temp_thumb:
             safe_delete(temp_thumb)
-        await bot.session.close()
+        if own_bot:
+            await bot.session.close()
 
 
 async def cleanup_task(ctx: dict):
@@ -556,6 +625,8 @@ class WorkerSettings:
     max_jobs = settings.worker_concurrency
     job_timeout = settings.job_timeout
     keep_result = 60
+    on_startup = worker_startup
+    on_shutdown = worker_shutdown
     # Periodic disk cleanup every hour
     cron_jobs: list[Any] = []
 
@@ -569,6 +640,8 @@ class RecognitionWorkerSettings:
     max_jobs = settings.worker_concurrency
     job_timeout = settings.job_timeout
     keep_result = 60
+    on_startup = worker_startup
+    on_shutdown = worker_shutdown
 
 
 class MusicWorkerSettings:
@@ -580,3 +653,5 @@ class MusicWorkerSettings:
     max_jobs = settings.worker_concurrency
     job_timeout = settings.job_timeout
     keep_result = 60
+    on_startup = worker_startup
+    on_shutdown = worker_shutdown

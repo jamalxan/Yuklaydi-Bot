@@ -3,7 +3,6 @@ from __future__ import annotations
 from aiogram import Router
 from aiogram.types import CallbackQuery, Message
 
-from bot.config import settings
 from bot.keyboards.inline import lyrics_nav_keyboard
 from bot.logger import logger
 from bot.services.cache import get_song_meta
@@ -47,10 +46,8 @@ async def handle_media(message: Message, user_lang: str):
         file_suffix = ".bin"
 
     try:
-        from arq import create_pool
-        from arq.connections import RedisSettings
-        rs = RedisSettings.from_dsn(settings.redis_url)
-        pool = await create_pool(rs)
+        from bot.services.queue import get_arq_pool
+        pool = await get_arq_pool()
         await pool.enqueue_job(
             "recognize_task",
             user_id=message.from_user.id,
@@ -61,7 +58,6 @@ async def handle_media(message: Message, user_lang: str):
             user_lang=lang,
             _queue_name="arq:queue:recognition",
         )
-        await pool.aclose()
     except Exception as e:
         logger.error(f"Failed to enqueue recognize job: {e}")
         await progress_msg.edit_text(_MSGS["not_found"].get(lang, "😔 Could not recognize."))
@@ -138,10 +134,8 @@ async def cb_download_song(callback: CallbackQuery, user_lang: str):
     progress_msg = await callback.message.answer(_MSGS["dl_hint"].get(lang, "🔍 Searching..."))
 
     try:
-        from arq import create_pool
-        from arq.connections import RedisSettings
         from bot.services.music_search import search_songs
-        rs = RedisSettings.from_dsn(settings.redis_url)
+        from bot.services.queue import get_arq_pool
 
         entries = await search_songs(f"{artist} {title}", max_results=5)
         if not entries:
@@ -149,7 +143,7 @@ async def cb_download_song(callback: CallbackQuery, user_lang: str):
             return
 
         entry = entries[0]
-        pool = await create_pool(rs)
+        pool = await get_arq_pool()
         await pool.enqueue_job(
             "music_download_task",
             user_id=callback.from_user.id,
@@ -162,8 +156,8 @@ async def cb_download_song(callback: CallbackQuery, user_lang: str):
             duration=entry.duration,
             thumbnail=entry.thumbnail,
             user_lang=lang,
+            _queue_name="arq:queue:music",
         )
-        await pool.aclose()
     except Exception as e:
         logger.error(f"dlsong task error: {e}")
         await progress_msg.edit_text("❌ Error fetching song.")

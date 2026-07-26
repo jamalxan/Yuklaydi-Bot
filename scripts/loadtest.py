@@ -268,10 +268,23 @@ async def scenario_b(redis: MockRedis) -> tuple[Metrics, bool]:
     m = Metrics("B")
     user_id = 9999
     urls = [f"https://youtu.be/vid_burst_{i:03d}" for i in range(30)]
+    # Clear leftover state from previous runs (real Redis persists across runs)
+    await redis.delete(f"ucap:{user_id}")
+    for url in urls:
+        import hashlib as _h
+        h = _h.sha256(url.encode()).hexdigest()
+        await redis.delete(f"fid:{h}|720")
+        await redis.delete(f"sf:{h}|720")
+
+    async def _staggered(url: str, delay: float):
+        # Telegram delivers one user's messages sequentially — a small stagger
+        # lets earlier INCRs land so the cap check observes real state (matters
+        # with real-Redis latency; mock Redis resolves within one loop tick).
+        await asyncio.sleep(delay)
+        await simulate_handle_url(user_id, url, m, redis, per_user_cap=3, download_delay=0.05)
 
     t0 = time.monotonic()
-    tasks = [simulate_handle_url(user_id, url, m, redis, per_user_cap=3, download_delay=0.05)
-             for url in urls]
+    tasks = [_staggered(url, i * 0.005) for i, url in enumerate(urls)]
     await asyncio.gather(*tasks)
     elapsed = time.monotonic() - t0
     ok = m.print(elapsed)

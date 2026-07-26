@@ -46,6 +46,45 @@ def _clean_search_query(title: str, artist: str) -> tuple[str, str]:
     return clean_title, clean_artist
 
 
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+)
+
+
+async def _search_lrclib(title: str, artist: str) -> Optional[str]:
+    """lrclib.net — free open lyrics API, no auth, no scraping."""
+    try:
+        import aiohttp
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Exact match endpoint first
+            async with session.get(
+                "https://lrclib.net/api/get",
+                params={"artist_name": artist, "track_name": title},
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    text = (data or {}).get("plainLyrics") or ""
+                    if len(text) > 50:
+                        return clean_lyrics(text)
+            # Fuzzy search fallback
+            async with session.get(
+                "https://lrclib.net/api/search",
+                params={"q": f"{artist} {title}"},
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                hits = await resp.json()
+        for hit in (hits or [])[:3]:
+            text = hit.get("plainLyrics") or ""
+            if len(text) > 50:
+                return clean_lyrics(text)
+    except Exception as e:
+        logger.warning(f"lrclib lookup failed: {str(e)[:120]}")
+    return None
+
+
 async def _search_genius(title: str, artist: str) -> Optional[str]:
     if not settings.genius_token:
         return None
@@ -59,8 +98,15 @@ async def _search_genius(title: str, artist: str) -> Optional[str]:
             retries=1,
             verbose=False,
             remove_section_headers=True,
+            user_agent=_BROWSER_UA,
         )
         genius.skip_non_songs = True
+        # Cloudflare 403s non-browser UAs on the lyrics pages — make sure the
+        # underlying requests session presents a browser UA either way.
+        try:
+            genius._session.headers["User-Agent"] = _BROWSER_UA
+        except Exception:
+            pass
 
         loop = asyncio.get_event_loop()
         song = await loop.run_in_executor(
@@ -125,14 +171,17 @@ async def _search_musixmatch(title: str, artist: str) -> Optional[str]:
 
 
 async def get_lyrics(title: str, artist: str) -> Optional[str]:
-    """Fetch lyrics: check cache → Genius → Musixmatch."""
+    """Fetch lyrics: cache → lrclib (fast, free) → Genius → Musixmatch."""
     cached = await get_song_cache(title, artist)
     if cached and cached.get("lyrics"):
         return cached["lyrics"]
 
     clean_title, clean_artist = _clean_search_query(title, artist)
 
-    lyrics = await _search_genius(clean_title, clean_artist)
+    lyrics = await _search_lrclib(clean_title, clean_artist)
+
+    if not lyrics:
+        lyrics = await _search_genius(clean_title, clean_artist)
 
     if not lyrics and settings.musixmatch_token:
         lyrics = await _search_musixmatch(clean_title, clean_artist)

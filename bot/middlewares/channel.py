@@ -8,7 +8,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.db.repo import SettingRepo
 from bot.db.session import async_session_factory
-from bot.services.cache import get_setting, set_setting_cache
+from bot.services.cache import (
+    get_cached_membership, get_setting, set_cached_membership, set_setting_cache,
+)
 
 
 _SKIP_COMMANDS = {"/start", "/admin", "/lang", "/help", "/statistics"}
@@ -54,12 +56,28 @@ class ChannelCheckMiddleware(BaseMiddleware):
         if not user_id:
             return await handler(event, data)
 
+        # Redis-cached membership — get_chat_member is a Telegram API round-trip
+        # and must NOT run on every message at high load. Cache errors fail
+        # open to the live API check.
         try:
-            member = await event.bot.get_chat_member(int(ch_id_str), user_id)
-            if member.status in ("member", "administrator", "creator"):
-                return await handler(event, data)
+            cached = await get_cached_membership(user_id)
         except Exception:
+            cached = None
+        if cached is True:
             return await handler(event, data)
+
+        if cached is None:
+            try:
+                member = await event.bot.get_chat_member(int(ch_id_str), user_id)
+                is_member = member.status in ("member", "administrator", "creator")
+            except Exception:
+                return await handler(event, data)
+            try:
+                await set_cached_membership(user_id, is_member)
+            except Exception:
+                pass
+            if is_member:
+                return await handler(event, data)
 
         # User not subscribed — send join prompt
         lang = data.get("user_lang", "uz")

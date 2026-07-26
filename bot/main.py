@@ -92,6 +92,8 @@ async def on_startup(bot: Bot):
 
 async def on_shutdown(bot: Bot):
     logger.info("Shutting down...")
+    from bot.services.queue import close_arq_pool
+    await close_arq_pool()
     await bot.session.close()
     await engine.dispose()
 
@@ -104,11 +106,13 @@ async def main():
     dp = Dispatcher(storage=storage)
 
     # Middlewares (order matters)
+    # Throttling FIRST — spam is rejected with one Redis round-trip before any
+    # DB session or user lookup happens (critical under request floods).
+    dp.message.middleware(ThrottlingMiddleware())
     dp.message.middleware(DbMiddleware())
     dp.callback_query.middleware(DbMiddleware())
     dp.message.middleware(UserLangMiddleware())
     dp.callback_query.middleware(UserLangMiddleware())
-    dp.message.middleware(ThrottlingMiddleware())
     dp.message.middleware(ChannelCheckMiddleware())
 
     # Routers — order determines handler priority

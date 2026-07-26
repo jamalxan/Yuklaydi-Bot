@@ -678,6 +678,8 @@ async def cb_channel_check(callback: CallbackQuery):
 
         member = await callback.bot.get_chat_member(int(ch_id_str), callback.from_user.id)
         if member.status in ("member", "administrator", "creator"):
+            from bot.services.cache import set_cached_membership
+            await set_cached_membership(callback.from_user.id, True)
             await callback.message.delete()
             await callback.answer(
                 {"uz": "✅ Obuna tasdiqlandi!", "ru": "✅ Подписка подтверждена!", "en": "✅ Subscription confirmed!"}.get("en", "✅"),

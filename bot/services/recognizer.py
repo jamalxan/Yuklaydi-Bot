@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from typing import Optional
@@ -47,18 +48,26 @@ async def _try_recognize_snippet(media_path: str, snippet_path: str,
         return None
 
     t0 = time.monotonic()
-    try:
-        logger.debug(f"[shazam] calling _shazam.recognize({snippet_path!r})")
-        raw_result = await _shazam.recognize(snippet_path)
-        elapsed = time.monotonic() - t0
-        matches = raw_result.get("matches", [])
-        logger.debug(f"[shazam] recognize() returned in {elapsed:.2f}s — matches={len(matches)} has_track={'track' in raw_result}")
-        if not matches and "track" not in raw_result:
-            logger.debug(f"[shazam] full raw response={raw_result}")
-    except Exception as exc:
-        elapsed = time.monotonic() - t0
-        logger.error(f"[shazam] recognize() RAISED after {elapsed:.2f}s: {type(exc).__name__}: {exc}", exc_info=True)
+    raw_result = None
+    for attempt in (1, 2):  # one retry on transient network failure
+        try:
+            logger.debug(f"[shazam] calling _shazam.recognize({snippet_path!r}) attempt={attempt}")
+            raw_result = await _shazam.recognize(snippet_path)
+            break
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            logger.warning(f"[shazam] recognize() attempt {attempt} failed after {elapsed:.2f}s: "
+                           f"{type(exc).__name__}: {exc}")
+            if attempt == 2:
+                return None
+            await asyncio.sleep(1.5)
+    if raw_result is None:
         return None
+    elapsed = time.monotonic() - t0
+    matches = raw_result.get("matches", [])
+    logger.debug(f"[shazam] recognize() returned in {elapsed:.2f}s — matches={len(matches)} has_track={'track' in raw_result}")
+    if not matches and "track" not in raw_result:
+        logger.debug(f"[shazam] full raw response={raw_result}")
 
     parsed = _parse_result(raw_result)
     if parsed:

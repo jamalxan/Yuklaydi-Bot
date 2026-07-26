@@ -212,11 +212,19 @@ def _build_opts(output_path: str, quality: str) -> dict:
         # No transcode for video — remux/mux only (skip for MP3 which needs re-encode)
         opts["postprocessor_args"] = {"default": ["-c", "copy"]}
 
+    _apply_cookies(opts)
+
+    return opts
+
+
+def _apply_cookies(opts: dict) -> None:
+    """Attach cookie sources to yt-dlp opts (cookies.txt and/or browser)."""
     cpath = cookies_path()
     if cpath:
         opts["cookiefile"] = cpath
-
-    return opts
+    if settings.cookies_from_browser:
+        # ("chrome",) tuple form = browser name without profile/keyring specs
+        opts["cookiesfrombrowser"] = (settings.cookies_from_browser,)
 
 
 # ── Sync download (runs in executor) ─────────────────────────────────────────
@@ -295,9 +303,7 @@ def _extract_info_sync(url: str) -> dict:
         "js_runtimes": {"node": {}},
         "remote_components": {"ejs:github"},
     }
-    cpath = cookies_path()
-    if cpath:
-        opts["cookiefile"] = cpath
+    _apply_cookies(opts)
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 

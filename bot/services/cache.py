@@ -22,7 +22,18 @@ SETTING_TTL = 60 * 5               # 5 min
 async def get_redis() -> aioredis.Redis:
     global _redis
     if _redis is None:
-        _redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+        _redis = aioredis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            # Fail fast instead of hanging the event loop when Redis stalls
+            socket_connect_timeout=5,
+            socket_timeout=10,
+            retry_on_timeout=True,
+            # Detect dead connections left behind by restarts/failovers
+            health_check_interval=30,
+            # Hard cap so a runaway burst can't open unbounded connections
+            max_connections=settings.redis_max_connections,
+        )
     return _redis
 
 
@@ -77,10 +88,13 @@ async def check_rate_limit(tg_id: int) -> tuple[bool, int]:
     await pipe.ttl(key)
     results = await pipe.execute()
     count, ttl = results[0], results[1]
-    if count == 1:
+    # Set the window on first hit; also repair a key that lost its TTL
+    # (crash between INCR and EXPIRE would otherwise rate-limit forever).
+    if count == 1 or ttl == -1:
         await r.expire(key, settings.rate_limit_window)
+        ttl = settings.rate_limit_window
     if count > settings.rate_limit_requests:
-        return False, max(ttl, settings.rate_limit_window)
+        return False, max(ttl, 1)
     return True, 0
 
 
@@ -185,12 +199,25 @@ async def acquire_user_slot(user_id: int) -> None:
     await pipe.execute()
 
 
+# Atomic floor-at-zero decrement — a GET/DECR pair races under concurrency
+# and can push the counter negative, permanently freeing extra slots.
+_RELEASE_SLOT_LUA = """
+local v = tonumber(redis.call('GET', KEYS[1]) or '0')
+if v > 0 then return redis.call('DECR', KEYS[1]) end
+return 0
+"""
+
+
 async def release_user_slot(user_id: int) -> None:
     r = await get_redis()
-    key = f"ucap:{user_id}"
-    v = await r.get(key)
-    if v and int(v) > 0:
-        await r.decr(key)
+    try:
+        await r.eval(_RELEASE_SLOT_LUA, 1, f"ucap:{user_id}")
+    except Exception:
+        # Fallback for Redis builds without EVAL (tests/mocks)
+        key = f"ucap:{user_id}"
+        v = await r.get(key)
+        if v and int(v) > 0:
+            await r.decr(key)
 
 
 # ── Single-flight lock (prevents N workers downloading the same URL) ───────────
@@ -231,6 +258,30 @@ async def store_song_meta(title: str, artist: str) -> str:
 async def get_song_meta(h: str) -> Optional[dict]:
     v = await (await get_redis()).get(f"smeta:{h}")
     return json.loads(v) if v else None
+
+
+# ── Channel-membership cache ──────────────────────────────────────────────────
+# get_chat_member is a Telegram API round-trip; without caching it runs on
+# EVERY message when a required channel is configured.
+
+_MEMBER_TTL = 600  # 10 min — re-check membership at most every 10 minutes
+
+
+async def get_cached_membership(user_id: int) -> Optional[bool]:
+    v = await (await get_redis()).get(f"chmem:{user_id}")
+    if v is None:
+        return None
+    return v == "1"
+
+
+async def set_cached_membership(user_id: int, is_member: bool) -> None:
+    # Non-members get a short TTL so a fresh subscription is noticed quickly
+    ttl = _MEMBER_TTL if is_member else 30
+    await (await get_redis()).setex(f"chmem:{user_id}", ttl, "1" if is_member else "0")
+
+
+async def invalidate_membership(user_id: int) -> None:
+    await (await get_redis()).delete(f"chmem:{user_id}")
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

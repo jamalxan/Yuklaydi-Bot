@@ -8,7 +8,6 @@ from aiogram import Router
 from aiogram.enums import ContentType
 from aiogram.types import CallbackQuery, Message
 
-from bot.config import settings
 from bot.keyboards.inline import audio_result_keyboard, music_search_keyboard
 from bot.logger import logger
 from bot.services.cache import (
@@ -150,10 +149,8 @@ async def cb_music_pick(callback: CallbackQuery, user_lang: str):
     progress_msg = await callback.message.answer(_MSGS["downloading"].get(lang, "⏳ Downloading..."))
 
     try:
-        from arq import create_pool
-        from arq.connections import RedisSettings
-        rs = RedisSettings.from_dsn(settings.redis_url)
-        pool = await create_pool(rs)
+        from bot.services.queue import get_arq_pool
+        pool = await get_arq_pool()
         await pool.enqueue_job(
             "music_download_task",
             user_id=callback.from_user.id,
@@ -168,7 +165,6 @@ async def cb_music_pick(callback: CallbackQuery, user_lang: str):
             user_lang=lang,
             _queue_name="arq:queue:music",
         )
-        await pool.aclose()
     except Exception as e:
         logger.error(f"Failed to enqueue music_download: {e}")
         await progress_msg.edit_text(_MSGS["error"].get(lang, "❌ Error."))

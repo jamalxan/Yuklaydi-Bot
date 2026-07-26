@@ -63,14 +63,16 @@ services:
 
   redis:
     image: redis:7-alpine
-    # allkeys-lru: evict least-recently-used keys when maxmemory is reached
-    # — file_id cache can grow large; LRU keeps hot content in memory
+    # volatile-lru (NOT allkeys-lru): only keys WITH a TTL (caches) are ever
+    # evicted. arq queue jobs have no TTL — allkeys-lru could silently drop
+    # queued downloads under memory pressure. 2gb headroom fits ~500k queued
+    # jobs plus the file_id cache.
     command: >
       redis-server
       --save 60 1
       --loglevel warning
-      --maxmemory 512mb
-      --maxmemory-policy allkeys-lru
+      --maxmemory 2gb
+      --maxmemory-policy volatile-lru
     volumes:
       - redis_data:/data
     restart: unless-stopped
@@ -112,7 +114,10 @@ services:
       DATABASE_URL: postgresql+asyncpg://bot:bot_password@pgbouncer:5432/yuklaydi_bot
       REDIS_URL: redis://redis:6379/0
       DOWNLOAD_DIR: /downloads
-      WORKER_CONCURRENCY: 5
+      # Jobs are mostly I/O-bound; the per-process yt-dlp semaphore
+      # (YT_DLP_WORKER_CONCURRENCY) caps the CPU/network-heavy part.
+      WORKER_CONCURRENCY: 20
+      YT_DLP_WORKER_CONCURRENCY: 4
     volumes:
       - downloads:/downloads
       - telegram_data:/var/lib/telegram-bot-api:ro
@@ -122,6 +127,7 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    # Scale horizontally for heavy load: docker compose up -d --scale worker=8
     deploy:
       replicas: 2
 

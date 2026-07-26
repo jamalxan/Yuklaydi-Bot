@@ -24,6 +24,14 @@ async def _noop_handler(event, data):
     return "handled"
 
 
+def _no_membership_cache():
+    """Patch the Redis membership cache to a miss so tests are deterministic."""
+    return (
+        patch("bot.middlewares.channel.get_cached_membership", new=AsyncMock(return_value=None)),
+        patch("bot.middlewares.channel.set_cached_membership", new=AsyncMock()),
+    )
+
+
 # ── Skip commands always pass through ────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -81,7 +89,8 @@ async def test_subscribed_user_passes_through(status):
     member_mock.status = status
     msg.bot.get_chat_member = AsyncMock(return_value=member_mock)
 
-    with patch("bot.middlewares.channel._get_channel_id", new=AsyncMock(return_value="-100123")):
+    p_get, p_set = _no_membership_cache()
+    with patch("bot.middlewares.channel._get_channel_id", new=AsyncMock(return_value="-100123")), p_get, p_set:
         result = await mw(_noop_handler, msg, {"user_lang": "uz"})
 
     assert result == "handled"
@@ -100,9 +109,11 @@ async def test_non_subscriber_gets_join_prompt():
     member_mock.status = "left"
     msg.bot.get_chat_member = AsyncMock(return_value=member_mock)
 
+    p_get, p_set = _no_membership_cache()
     with (
         patch("bot.middlewares.channel._get_channel_id", new=AsyncMock(return_value="-100123")),
         patch("bot.middlewares.channel.async_session_factory") as mock_factory,
+        p_get, p_set,
     ):
         mock_session = AsyncMock()
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
@@ -134,9 +145,11 @@ async def test_non_subscriber_prompt_includes_keyboard():
     member_mock.status = "kicked"
     msg.bot.get_chat_member = AsyncMock(return_value=member_mock)
 
+    p_get, p_set = _no_membership_cache()
     with (
         patch("bot.middlewares.channel._get_channel_id", new=AsyncMock(return_value="-100456")),
         patch("bot.middlewares.channel.async_session_factory") as mock_factory,
+        p_get, p_set,
     ):
         mock_session = AsyncMock()
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
@@ -165,7 +178,8 @@ async def test_api_error_passes_through():
 
     msg.bot.get_chat_member = AsyncMock(side_effect=Exception("Forbidden"))
 
-    with patch("bot.middlewares.channel._get_channel_id", new=AsyncMock(return_value="-100999")):
+    p_get, p_set = _no_membership_cache()
+    with patch("bot.middlewares.channel._get_channel_id", new=AsyncMock(return_value="-100999")), p_get, p_set:
         result = await mw(_noop_handler, msg, {"user_lang": "ru"})
 
     assert result == "handled"

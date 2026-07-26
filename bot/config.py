@@ -25,6 +25,11 @@ class Settings(BaseSettings):
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"
+    redis_max_connections: int = 512
+
+    # DB pool (per process; route through PgBouncer when scaling out)
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
 
     # Lyrics
     genius_token: str = ""
@@ -38,6 +43,10 @@ class Settings(BaseSettings):
     download_dir: str = "./downloads"
     worker_concurrency: int = 5
     cookies_file: str = ""
+    # e.g. "chrome" / "firefox" / "edge" — yt-dlp reads cookies straight from
+    # the browser profile. Needed for Instagram (login-gated since 2024+) and
+    # helps YouTube dodge bot-checks. Empty = disabled.
+    cookies_from_browser: str = ""
 
     # Rate limiting
     rate_limit_requests: int = 10
@@ -45,9 +54,10 @@ class Settings(BaseSettings):
 
     # Fairness / scale
     per_user_download_cap: int = 3       # max simultaneous fresh downloads per user
-    yt_dlp_worker_concurrency: int = 3   # max concurrent yt-dlp calls per worker process
-    job_timeout: int = 150               # arq job hard timeout (seconds)
-    max_queue_depth: int = 2000          # reject new jobs above this depth
+    yt_dlp_worker_concurrency: int = 4   # max concurrent yt-dlp calls per worker process
+    job_timeout: int = 300               # arq job hard timeout (seconds)
+    single_flight_wait: int = 60         # max seconds a duplicate-URL job waits for cache
+    max_queue_depth: int = 100_000       # reject new jobs above this depth (backpressure)
 
     # Logging
     log_level: str = "INFO"

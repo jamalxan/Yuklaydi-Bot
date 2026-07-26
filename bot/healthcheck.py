@@ -183,7 +183,10 @@ async def check_yt_dlp() -> None:
     print("\n── 6. yt-dlp ─────────────────────────────────────────────────────")
     try:
         import yt_dlp
-        ver = getattr(yt_dlp, "__version__", "unknown")
+        try:
+            from yt_dlp.version import __version__ as ver
+        except Exception:
+            ver = getattr(yt_dlp, "__version__", "unknown")
         ok("yt-dlp importable", f"version={ver}")
         # Check version is reasonably recent (>= 2026)
         if ver.startswith("20") and int(ver[:4]) < 2026:

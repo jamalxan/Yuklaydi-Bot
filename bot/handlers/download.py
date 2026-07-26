@@ -52,30 +52,22 @@ def _ack_text(lang: str, active: int, cap: int) -> str:
     return _DL["queued"].get(lang, "📋 Queued...")
 
 
-async def _get_pool():
-    from arq import create_pool
-    from arq.connections import RedisSettings
-    return await create_pool(RedisSettings.from_dsn(settings.redis_url))
-
-
 async def _enqueue_download(chat_id: int, message_id: int, user_id: int,
                              url: str, platform: str, quality: str, lang: str,
                              queue: str = "arq:queue") -> None:
-    pool = await _get_pool()
-    try:
-        await pool.enqueue_job(
-            "download_task",
-            user_id=user_id,
-            chat_id=chat_id,
-            message_id=message_id,
-            url=url,
-            platform=platform,
-            quality=quality,
-            user_lang=lang,
-            _queue_name=queue,
-        )
-    finally:
-        await pool.aclose()
+    from bot.services.queue import get_arq_pool
+    pool = await get_arq_pool()
+    await pool.enqueue_job(
+        "download_task",
+        user_id=user_id,
+        chat_id=chat_id,
+        message_id=message_id,
+        url=url,
+        platform=platform,
+        quality=quality,
+        user_lang=lang,
+        _queue_name=queue,
+    )
 
 
 @router.message(lambda m: bool(extract_url(m.text or "")))
@@ -192,21 +184,19 @@ async def cb_video_shazam(callback: CallbackQuery, user_lang: str):
     progress_msg = await callback.message.answer(_DL["recognizing"].get(lang, "🎧 Recognizing..."))
 
     try:
-        pool = await _get_pool()
-        try:
-            await pool.enqueue_job(
-                "recognize_task",
-                user_id=callback.from_user.id,
-                chat_id=callback.message.chat.id,
-                message_id=progress_msg.message_id,
-                file_id=file_id,
-                file_suffix=file_suffix,
-                user_lang=lang,
-                source_url=source_url,
-                _queue_name="arq:queue:recognition",
-            )
-        finally:
-            await pool.aclose()
+        from bot.services.queue import get_arq_pool
+        pool = await get_arq_pool()
+        await pool.enqueue_job(
+            "recognize_task",
+            user_id=callback.from_user.id,
+            chat_id=callback.message.chat.id,
+            message_id=progress_msg.message_id,
+            file_id=file_id,
+            file_suffix=file_suffix,
+            user_lang=lang,
+            source_url=source_url,
+            _queue_name="arq:queue:recognition",
+        )
     except Exception as e:
         logger.error(f"Failed to enqueue vshz recognize: {e}")
         await progress_msg.edit_text("😔 Could not process video.")

@@ -6,12 +6,20 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from bot.config import settings
 
+# asyncpg's prepared-statement cache breaks behind PgBouncer in transaction
+# pool mode ("prepared statement does not exist" errors) — disable it there.
+_connect_args: dict = {}
+if "pgbouncer" in settings.database_url:
+    _connect_args["statement_cache_size"] = 0
+
 engine = create_async_engine(
     settings.database_url,
-    pool_size=10,
-    max_overflow=20,
+    pool_size=settings.db_pool_size,
+    max_overflow=settings.db_max_overflow,
     pool_pre_ping=True,
+    pool_recycle=1800,
     echo=False,
+    connect_args=_connect_args,
 )
 
 async_session_factory = async_sessionmaker(
