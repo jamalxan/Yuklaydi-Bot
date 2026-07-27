@@ -12,7 +12,7 @@ import aiohttp
 from aiogram import Bot
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import BufferedInputFile, FSInputFile
 
 from bot.config import settings
@@ -149,6 +149,22 @@ async def worker_shutdown(ctx: dict) -> None:
     logger.info("Worker shutdown: Bot session closed")
 
 
+async def _flood_retry(coro_factory, max_wait: int = 30):
+    """Run a Telegram send; on flood-control RetryAfter wait and retry once.
+
+    Under burst load Telegram answers RetryAfter; without this the job fails
+    with an error message even though the content would send fine a moment
+    later (user sees an error AND, on client-timeout races, the real content).
+    """
+    try:
+        return await coro_factory()
+    except TelegramRetryAfter as e:
+        wait = min(int(getattr(e, "retry_after", 5)) + 1, max_wait)
+        logger.warning(f"Flood control: retrying send in {wait}s")
+        await asyncio.sleep(wait)
+        return await coro_factory()
+
+
 async def _safe_edit(bot: Bot, chat_id: int, message_id: int, text: str, **kwargs) -> None:
     try:
         await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, **kwargs)
@@ -173,10 +189,12 @@ async def _send_cached(bot: Bot, chat_id: int, message_id: int,
     from bot.keyboards.inline import video_result_keyboard
     kb = video_result_keyboard(url_key, shazam_key, lang)
     if quality == "mp3":
-        await bot.send_audio(chat_id, audio=file_id, caption="🤖 @vidyuklaydi_bot")
+        await _flood_retry(lambda: bot.send_audio(
+            chat_id, audio=file_id, caption="🤖 @vidyuklaydi_bot"))
     else:
-        await bot.send_video(chat_id, video=file_id, caption="🤖 @vidyuklaydi_bot",
-                             supports_streaming=True, reply_markup=kb)
+        await _flood_retry(lambda: bot.send_video(
+            chat_id, video=file_id, caption="🤖 @vidyuklaydi_bot",
+            supports_streaming=True, reply_markup=kb))
     try:
         await bot.delete_message(chat_id, message_id)
     except Exception:
@@ -264,18 +282,18 @@ async def download_task(
         size_mb = round(result.size_bytes / 1024 / 1024, 1)
 
         if quality == "mp3":
-            sent = await bot.send_audio(
+            sent = await _flood_retry(lambda: bot.send_audio(
                 chat_id, audio=input_file,
                 caption="🤖 @vidyuklaydi_bot",
-            )
+            ))
             assert sent.audio is not None
             file_id = sent.audio.file_id
         else:
-            sent = await bot.send_video(
+            sent = await _flood_retry(lambda: bot.send_video(
                 chat_id, video=input_file,
                 caption="🤖 @vidyuklaydi_bot",
                 supports_streaming=True,
-            )
+            ))
             assert sent.video is not None
             file_id = sent.video.file_id
 
@@ -566,7 +584,7 @@ async def music_download_task(
         song_key = await store_song_meta(title, artist)
         kb = audio_result_keyboard(song_key, lang)
 
-        sent = await bot.send_audio(
+        sent = await _flood_retry(lambda: bot.send_audio(
             chat_id,
             audio=FSInputFile(temp_audio),
             title=title,
@@ -575,7 +593,7 @@ async def music_download_task(
             thumbnail=thumb_input,
             caption="🤖 @vidyuklaydi_bot",
             reply_markup=kb,
-        )
+        ))
 
         from bot.services.cache import set_audio_file_id
         assert sent.audio is not None

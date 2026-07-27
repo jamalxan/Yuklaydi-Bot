@@ -1,35 +1,56 @@
-# Restart all bot processes: stop old ones, start new ones
-# Run this script to apply code/config changes
+﻿# Restart all bot processes: stop old ones, VERIFY they are gone, start new ones.
+# A second live bot instance polling Telegram causes duplicated/conflicting
+# replies - this script guarantees exactly one instance of each process.
 
 $venv = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
 $proj = $PSScriptRoot
 
+function Get-BotProcs {
+    Get-WmiObject Win32_Process -Filter "Name='python.exe'" | Where-Object {
+        $_.CommandLine -match 'bot\.main|bot\.worker\.tasks'
+    }
+}
+
 Write-Host "=== Stopping old processes ===" -ForegroundColor Yellow
-Get-WmiObject Win32_Process -Filter "Name='python.exe'" | Where-Object {
-    $_.CommandLine -like "*bot.main*" -or
-    $_.CommandLine -like "*bot.worker.tasks*"
-} | ForEach-Object {
-    Write-Host "  Stopping PID $($_.ProcessId): $($_.CommandLine.Substring(0, [Math]::Min(80, $_.CommandLine.Length)))"
+Get-BotProcs | ForEach-Object {
+    Write-Host "  Stopping PID $($_.ProcessId)"
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
 }
-Start-Sleep -Seconds 2
+
+# Wait until they are REALLY gone (up to 15s) - starting on top of a
+# surviving instance means two pollers and duplicated messages.
+$deadline = (Get-Date).AddSeconds(15)
+while ((Get-Date) -lt $deadline) {
+    $left = @(Get-BotProcs)
+    if ($left.Count -eq 0) { break }
+    Start-Sleep -Milliseconds 500
+}
+$left = @(Get-BotProcs)
+if ($left.Count -gt 0) {
+    Write-Host "ERROR: $($left.Count) old process(es) still alive - NOT starting new ones." -ForegroundColor Red
+    $left | ForEach-Object { Write-Host "  PID $($_.ProcessId): $($_.CommandLine)" }
+    exit 1
+}
+
+if (-not (Test-Path "$proj\logs")) { New-Item -ItemType Directory "$proj\logs" | Out-Null }
 
 Write-Host "=== Starting bot + 3 workers ===" -ForegroundColor Green
-$cd = "cd '$proj';"
+Start-Process $venv -ArgumentList "-m","bot.main" -WorkingDirectory $proj -WindowStyle Hidden `
+    -RedirectStandardOutput "$proj\logs\bot.out.log" -RedirectStandardError "$proj\logs\bot.err.log"
+Start-Process $venv -ArgumentList "-m","arq","bot.worker.tasks.WorkerSettings" -WorkingDirectory $proj -WindowStyle Hidden `
+    -RedirectStandardOutput "$proj\logs\worker.out.log" -RedirectStandardError "$proj\logs\worker.err.log"
+Start-Process $venv -ArgumentList "-m","arq","bot.worker.tasks.RecognitionWorkerSettings" -WorkingDirectory $proj -WindowStyle Hidden `
+    -RedirectStandardOutput "$proj\logs\worker_recog.out.log" -RedirectStandardError "$proj\logs\worker_recog.err.log"
+Start-Process $venv -ArgumentList "-m","arq","bot.worker.tasks.MusicWorkerSettings" -WorkingDirectory $proj -WindowStyle Hidden `
+    -RedirectStandardOutput "$proj\logs\worker_music.out.log" -RedirectStandardError "$proj\logs\worker_music.err.log"
 
-# Main bot
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "$cd & '$venv' -m bot.main 2>&1 | Tee-Object -FilePath logs\bot.log -Append" -WindowStyle Normal
+Start-Sleep -Seconds 8
 
-Start-Sleep -Seconds 1
-
-# Download worker
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "$cd & '$venv' -m arq bot.worker.tasks.WorkerSettings 2>&1 | Tee-Object -FilePath logs\worker.log -Append" -WindowStyle Minimized
-
-# Recognition worker
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "$cd & '$venv' -m arq bot.worker.tasks.RecognitionWorkerSettings 2>&1 | Tee-Object -FilePath logs\worker_recog.log -Append" -WindowStyle Minimized
-
-# Music worker
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "$cd & '$venv' -m arq bot.worker.tasks.MusicWorkerSettings 2>&1 | Tee-Object -FilePath logs\worker_music.log -Append" -WindowStyle Minimized
-
-Write-Host "All processes started. Logs: logs\bot.log, logs\worker*.log" -ForegroundColor Cyan
-Write-Host "Local API: http://localhost:8081 (docker: vidbot-localapi)" -ForegroundColor Cyan
+# Verify: 4 logical processes (each may show a venv-launcher parent + child pair)
+$procs = @(Get-BotProcs)
+$mains = @($procs | Where-Object { $_.CommandLine -match 'bot\.main' -and $_.ParentProcessId -notin $procs.ProcessId })
+Write-Host "Running bot processes: $($procs.Count) total, $($mains.Count) bot.main root instance(s)" -ForegroundColor Cyan
+if ($mains.Count -ne 1) {
+    Write-Host "WARNING: expected exactly 1 bot.main root instance!" -ForegroundColor Red
+}
+Write-Host "Logs: logs\bot.out.log, logs\worker*.log" -ForegroundColor Cyan
