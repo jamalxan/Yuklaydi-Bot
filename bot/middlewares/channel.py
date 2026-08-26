@@ -6,6 +6,7 @@ from aiogram import BaseMiddleware
 from aiogram.types import InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from bot.config import settings
 from bot.db.repo import SettingRepo
 from bot.db.session import async_session_factory
 from bot.services.cache import get_setting, set_setting_cache
@@ -46,11 +47,19 @@ class ChannelCheckMiddleware(BaseMiddleware):
         if event.text and any(event.text.startswith(cmd) for cmd in _SKIP_COMMANDS):
             return await handler(event, data)
 
+        user_id = event.from_user.id if event.from_user else None
+
+        # Admins must never be locked out of the admin panel (broadcast/ban/welcome/
+        # channel-setup FSM steps are plain-text messages that would otherwise hit
+        # this same-channel-subscription wall) — including when they set/change the
+        # required channel and haven't joined it themselves yet.
+        if user_id is not None and user_id in settings.admin_ids:
+            return await handler(event, data)
+
         ch_id_str = await _get_channel_id()
         if not ch_id_str:
             return await handler(event, data)
 
-        user_id = event.from_user.id if event.from_user else None
         if not user_id:
             return await handler(event, data)
 

@@ -16,7 +16,8 @@ HELP_TEXTS = {
     "uz": (
         "ℹ️ <b>Yuklaydi Bot</b>\n\n"
         "📥 <b>Video yuklash:</b>\n"
-        "YouTube, TikTok, Instagram, Facebook, Twitter/X va boshqa saytlardan havola yuboring.\n\n"
+        "YouTube, TikTok, Instagram, Facebook, Twitter/X va boshqa saytlardan havola yuboring. "
+        "Bir xabarda bir nechta havola yuborsangiz ham — hammasini alohida yuklab beramiz.\n\n"
         "🎵 <b>Qo'shiq topish:</b>\n"
         "Ovozli xabar, video yoki audio faylni yuboring — qo'shiq aniqlanadi.\n\n"
         "🔍 <b>Musiqa qidirish:</b>\n"
@@ -26,7 +27,8 @@ HELP_TEXTS = {
     "ru": (
         "ℹ️ <b>Yuklaydi Bot</b>\n\n"
         "📥 <b>Скачать видео:</b>\n"
-        "Отправьте ссылку на YouTube, TikTok, Instagram, Facebook, Twitter/X и другие.\n\n"
+        "Отправьте ссылку на YouTube, TikTok, Instagram, Facebook, Twitter/X и другие. "
+        "Можно отправить сразу несколько ссылок одним сообщением — обработаем каждую.\n\n"
         "🎵 <b>Найти песню:</b>\n"
         "Отправьте голосовое, видео или аудио — определим песню.\n\n"
         "🔍 <b>Поиск музыки:</b>\n"
@@ -36,7 +38,8 @@ HELP_TEXTS = {
     "en": (
         "ℹ️ <b>Yuklaydi Bot</b>\n\n"
         "📥 <b>Download Video:</b>\n"
-        "Send a link from YouTube, TikTok, Instagram, Facebook, Twitter/X and more.\n\n"
+        "Send a link from YouTube, TikTok, Instagram, Facebook, Twitter/X and more. "
+        "You can send several links in one message — each comes back separately.\n\n"
         "🎵 <b>Find Song:</b>\n"
         "Send a voice message, video, or audio — we'll identify the song.\n\n"
         "🔍 <b>Music Search:</b>\n"

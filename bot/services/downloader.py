@@ -183,6 +183,11 @@ def _build_opts(output_path: str, quality: str) -> dict:
         "js_runtimes": {"node": {}},
         # Download EJS challenge-solver script from GitHub on first use (cached)
         "remote_components": {"ejs:github"},
+        # Tie-break among equally-eligible formats toward h264/aac — plays inline
+        # everywhere (Telegram's own preview, iOS, older Android WebViews) without
+        # a server-side transcode, unlike vp9/av1 muxed into an mp4 container.
+        # Doesn't override the explicit height caps in the format selector above.
+        "format_sort": ["res", "vcodec:h264", "acodec:aac"],
     }
 
     # aria2c: multi-connection HTTP downloads (big win for single-file MP4s)

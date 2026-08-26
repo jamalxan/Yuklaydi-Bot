@@ -155,6 +155,64 @@ async def test_non_subscriber_prompt_includes_keyboard():
     assert call_kwargs["reply_markup"] is not None
 
 
+# ── Admins bypass the channel wall entirely ──────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_admin_bypasses_channel_check_even_when_not_subscribed():
+    """Admins must never get walled off by the required-channel check — including
+    on the plain-text FSM steps of their own admin panel (broadcast text, ban ID,
+    welcome message, channel id) which aren't in _SKIP_COMMANDS."""
+    from bot.middlewares.channel import ChannelCheckMiddleware
+
+    with patch("bot.middlewares.channel.settings") as mock_settings:
+        mock_settings.admin_ids = [12345]
+        mw = ChannelCheckMiddleware()
+        msg = _make_message("-1001234567890", user_id=12345)  # e.g. typing a channel id
+
+        # get_chat_member would report "left" if it were ever called
+        member_mock = MagicMock()
+        member_mock.status = "left"
+        msg.bot.get_chat_member = AsyncMock(return_value=member_mock)
+
+        with patch("bot.middlewares.channel._get_channel_id", new=AsyncMock(return_value="-100123")):
+            result = await mw(_noop_handler, msg, {"user_lang": "uz"})
+
+    assert result == "handled"
+    msg.answer.assert_not_called()
+    msg.bot.get_chat_member.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_non_admin_still_walled_off():
+    """Sanity check: the admin bypass must not accidentally exempt everyone."""
+    from bot.middlewares.channel import ChannelCheckMiddleware
+
+    with patch("bot.middlewares.channel.settings") as mock_settings:
+        mock_settings.admin_ids = [12345]
+        mw = ChannelCheckMiddleware()
+        msg = _make_message("hello", user_id=99999)
+
+        member_mock = MagicMock()
+        member_mock.status = "left"
+        msg.bot.get_chat_member = AsyncMock(return_value=member_mock)
+
+        with (
+            patch("bot.middlewares.channel._get_channel_id", new=AsyncMock(return_value="-100123")),
+            patch("bot.middlewares.channel.async_session_factory") as mock_factory,
+        ):
+            mock_session = AsyncMock()
+            mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_session.__aexit__ = AsyncMock(return_value=False)
+            mock_factory.return_value = mock_session
+            repo_mock = AsyncMock()
+            repo_mock.get = AsyncMock(return_value="")
+            with patch("bot.middlewares.channel.SettingRepo", return_value=repo_mock):
+                result = await mw(_noop_handler, msg, {"user_lang": "uz"})
+
+    assert result is None
+    msg.answer.assert_called_once()
+
+
 # ── API error → pass through (fail-open for resilience) ───────────────────────
 
 @pytest.mark.asyncio

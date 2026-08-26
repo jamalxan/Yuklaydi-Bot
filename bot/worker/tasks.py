@@ -160,12 +160,19 @@ async def download_task(
         # for the cache key to appear and serve from cache; else download ourselves.
         sf_acquired = await acquire_single_flight(url, quality, ttl=settings.job_timeout)
         if not sf_acquired:
-            # Wait for the concurrent download to populate cache
+            # Wait for the concurrent download to populate cache. Also keep trying
+            # to grab the lock ourselves: if the other worker's download fails fast
+            # (bad URL, network error) it releases the lock almost immediately, and
+            # without this we'd otherwise sit idle for the full job_timeout before
+            # noticing — starving this request for no reason.
             file_id_from_flight: Optional[str] = None
             for _ in range(settings.job_timeout):
                 await asyncio.sleep(1)
                 file_id_from_flight = await get_file_id(url, quality)
                 if file_id_from_flight:
+                    break
+                sf_acquired = await acquire_single_flight(url, quality, ttl=settings.job_timeout)
+                if sf_acquired:
                     break
 
             if file_id_from_flight:
@@ -188,8 +195,12 @@ async def download_task(
                             t_total=round(time.monotonic() - t_total_start, 2),
                             from_cache=True, single_flight=True, local_api=settings.use_local_api)
                 return
-            # Lock expired before cache was populated — fall through and download ourselves
-            sf_acquired = await acquire_single_flight(url, quality, ttl=settings.job_timeout)
+            # Neither a cached result nor the lock showed up within job_timeout —
+            # fall through and download ourselves. (If the loop above already won
+            # the lock, sf_acquired is already True — don't re-acquire, that would
+            # fail against our own held key and leak it until TTL expiry.)
+            if not sf_acquired:
+                sf_acquired = await acquire_single_flight(url, quality, ttl=settings.job_timeout)
 
         # ── Phase B: download (guarded by per-worker concurrency semaphore) ───
         async with _get_yt_dlp_sem():
@@ -398,6 +409,7 @@ async def recognize_task(
             "coverart": result.coverart,
             "apple_url": result.apple_url,
             "shazam_url": result.shazam_url,
+            "spotify_url": result.spotify_url,
             "lyrics": lyrics,
         })
 
@@ -408,7 +420,8 @@ async def recognize_task(
                 if lyrics:
                     await SongCacheRepo(session).save(result.title, result.artist, lyrics)
                 await RecognitionRepo(session).inc_daily()
-                await RecognitionRepo(session).log(user_id, result.title, result.artist, found_lyrics=bool(lyrics))
+                await RecognitionRepo(session).log(user_id, result.title, result.artist,
+                                                    found_lyrics=bool(lyrics), source=result.source)
                 await UserRepo(session).inc_recognitions(user_id)
                 await UserRepo(session).touch(user_id)
         except Exception as e:
@@ -419,6 +432,7 @@ async def recognize_task(
         kb = song_card_keyboard(
             apple_url=result.apple_url,
             shazam_url=result.shazam_url,
+            spotify_url=result.spotify_url,
             has_lyrics=bool(lyrics),
             song_key=song_key,
             lang=lang,

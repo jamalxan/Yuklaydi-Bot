@@ -8,9 +8,18 @@ A production-grade Telegram bot that:
 - 3 languages: Uzbek, Russian, English
 - Local Bot API server (2 GB file limit, fast `file://` uploads)
 - Redis `file_id` cache — repeat requests are near-instant
-- Async arq worker queue — bot never blocks
+- Single-flight dedup — if 10 users paste the same link at once, only one worker
+  downloads it; the rest get served from cache the moment it lands
+- Multiple links in one message — paste several TikTok/Instagram/YouTube URLs
+  at once, each comes back as its own result (capped at 5 per message)
+- Async arq worker queue — bot never blocks, with separate queues/lanes for
+  downloads, song recognition, and music search so one doesn't starve another
 - Rate limiting per user
 - Admin stats, broadcast, ban/unban
+- Song recognition: Shazam first, with an optional AudD.io fallback (set
+  `AUDD_TOKEN`) for the tracks Shazam's database misses — regional releases,
+  remixes, covers. Results link out to Apple Music, Spotify, and Shazam, plus
+  lyrics (Genius, with Musixmatch as a fallback) and one-tap MP3 download
 
 ---
 
@@ -24,6 +33,8 @@ Copy `.env.example` to `.env` and fill in:
 | `TELEGRAM_API_ID` | Telegram API ID | [my.telegram.org](https://my.telegram.org) |
 | `TELEGRAM_API_HASH` | Telegram API hash | [my.telegram.org](https://my.telegram.org) |
 | `GENIUS_TOKEN` | Genius API token | [genius.com/api-clients](https://genius.com/api-clients) |
+| `MUSIXMATCH_TOKEN` | Musixmatch API token (optional lyrics fallback) | [developer.musixmatch.com](https://developer.musixmatch.com) |
+| `AUDD_TOKEN` | AudD.io API token (optional Shazam fallback) | [dashboard.audd.io](https://dashboard.audd.io) |
 | `ADMIN_IDS` | Comma-separated Telegram user IDs | Your own Telegram ID |
 | `DATABASE_URL` | PostgreSQL connection URL | Set in docker-compose |
 | `REDIS_URL` | Redis connection URL | Set in docker-compose |

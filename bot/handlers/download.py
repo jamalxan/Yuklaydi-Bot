@@ -40,9 +40,30 @@ _ERR = {
 }
 
 
+MAX_URLS_PER_MESSAGE = 5
+
+
 def extract_url(text: str) -> Optional[str]:
     m = URL_RE.search(text or "")
     return m.group(0) if m else None
+
+
+def extract_urls(text: str) -> list[str]:
+    """All distinct links in a message, in order, capped at MAX_URLS_PER_MESSAGE.
+
+    Lets a user paste several TikTok/Instagram/YouTube links in one message and
+    get each one back, instead of only ever seeing the first.
+    """
+    seen: set[str] = set()
+    urls: list[str] = []
+    for m in URL_RE.finditer(text or ""):
+        u = m.group(0)
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+        if len(urls) >= MAX_URLS_PER_MESSAGE:
+            break
+    return urls
 
 
 def _ack_text(lang: str, active: int, cap: int) -> str:
@@ -78,13 +99,8 @@ async def _enqueue_download(chat_id: int, message_id: int, user_id: int,
         await pool.aclose()
 
 
-@router.message(lambda m: bool(extract_url(m.text or "")))
-async def handle_url(message: Message, user_lang: str, user_repo: UserRepo, download_repo: DownloadRepo):
-    url = extract_url(message.text)
-    if not url:
-        return
-
-    lang = user_lang or "en"
+async def _process_one_url(message: Message, url: str, lang: str,
+                            user_repo: UserRepo, download_repo: DownloadRepo) -> None:
     platform = detect_platform(url)
     normalized = normalize_url(url)
 
@@ -127,6 +143,20 @@ async def handle_url(message: Message, user_lang: str, user_repo: UserRepo, down
     except Exception as e:
         logger.error(f"Failed to enqueue download: {e}")
         await progress_msg.edit_text(_ERR["generic"].get(lang, "❌ Error."))
+
+
+@router.message(lambda m: bool(extract_url(m.text or "")))
+async def handle_url(message: Message, user_lang: str, user_repo: UserRepo, download_repo: DownloadRepo):
+    urls = extract_urls(message.text)
+    if not urls:
+        return
+
+    lang = user_lang or "en"
+
+    # Several links pasted in one message (a common paste-a-list workflow) —
+    # process each independently so every one comes back as its own result.
+    for url in urls:
+        await _process_one_url(message, url, lang, user_repo, download_repo)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("vdalt:"))

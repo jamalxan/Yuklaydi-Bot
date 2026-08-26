@@ -45,16 +45,19 @@ def song_card_keyboard(
     song_key: str,
     lang: str,
     show_download: bool = True,
+    spotify_url: Optional[str] = None,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
     listen_btns = []
     if apple_url:
         listen_btns.append(InlineKeyboardButton(text="🍎 Apple Music", url=apple_url))
+    if spotify_url:
+        listen_btns.append(InlineKeyboardButton(text="🟢 Spotify", url=spotify_url))
     if shazam_url:
         listen_btns.append(InlineKeyboardButton(text="🎧 Shazam", url=shazam_url))
-    if listen_btns:
-        builder.row(*listen_btns)
+    for i in range(0, len(listen_btns), 2):
+        builder.row(*listen_btns[i:i + 2])
 
     # callback_data uses 12-char hash key (≤21 bytes total, well under 64-byte limit)
     if has_lyrics:
