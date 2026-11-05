@@ -6,6 +6,10 @@ set -e
 if [ "$(id -u)" = "0" ]; then
     mkdir -p /downloads/tmp
     chown app:app /downloads /downloads/tmp 2>/dev/null || true
+    # setpriv keeps root's environment: without HOME=/home/app, libraries
+    # that look in ~ (asyncpg reads ~/.postgresql/postgresql.key for the
+    # optional client cert) hit /root and fail with "Permission denied".
+    export HOME=/home/app USER=app LOGNAME=app
     exec setpriv --reuid=app --regid=app --init-groups "$@"
 fi
 

@@ -445,7 +445,7 @@ def check_limits(info: dict, quality: str) -> None:
 
 
 # Partial / bookkeeping files yt-dlp may leave next to the real output.
-_JUNK_MARKERS = (".part", ".ytdl", ".temp", ".tmp")
+_JUNK_MARKERS = (".part", ".ytdl", ".temp", ".tmp", ".aria2")  # .aria2 = aria2c control file
 
 
 def _is_junk(fname: str) -> bool:
@@ -486,7 +486,15 @@ def resolve_output_path(info: Optional[dict], expected: str) -> str:
 # Stream-fetch failures worth one retry with other YouTube clients. A 403
 # reaches us verbatim from yt-dlp's own downloader, but when ffmpeg does the
 # fetching (download_ranges clips, HLS) only its exit status survives.
-_RETRYABLE_MARKERS = ("http error 403", "ffmpeg exited with code", "unable to download video data")
+# How a dead stream URL (YouTube 403) surfaces, per downloader: yt-dlp's own
+# ("HTTP Error 403"), ffmpeg for HLS/DASH ("ffmpeg exited with code"), and
+# aria2c — used in the Docker image — which reports only its exit code
+# (22 = bad HTTP response). Without the aria2c marker the client fallback
+# never ran in production.
+_RETRYABLE_MARKERS = (
+    "http error 403", "ffmpeg exited with code", "unable to download video data",
+    "aria2c exited with code",
+)
 
 
 def _is_forbidden(exc: BaseException) -> bool:

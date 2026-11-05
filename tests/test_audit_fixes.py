@@ -1454,3 +1454,31 @@ def test_download_sync_accepts_video_above_one_upload(tmp_path):
         assert r.size_bytes == 60 * 1024 * 1024
         with patch.object(settings, "split_large_videos", False), pytest.raises(d.DownloadError):
             d._download_sync("https://youtu.be/x", str(out), "720")
+
+
+def test_aria2c_failure_triggers_youtube_client_fallback():
+    """In Docker yt-dlp downloads through aria2c; a 403 there is only
+    "aria2c exited with code 22" and must still trigger the fallback."""
+    import yt_dlp
+    from bot.services import downloader as d
+
+    class _Aria403(_FakeYDL):
+        def process_ie_result(self, info, download=True):
+            clients = self.opts["extractor_args"]["youtube"]["player_client"]
+            _FakeYDL.calls.append(clients)
+            if clients == ["default"]:
+                raise yt_dlp.utils.DownloadError("ERROR: aria2c exited with code 22")
+            return info
+
+    _FakeYDL.calls = []
+    with patch("yt_dlp.YoutubeDL", _Aria403):
+        d.run_ydl("https://youtu.be/abc", d.build_base_opts(outtmpl="/t/ydl_r.mp4"), "720")
+    assert _FakeYDL.calls == [["default"], ["web_embedded"]]
+
+
+def test_aria2_control_file_is_junk(tmp_path):
+    from bot.services import downloader as d
+    (tmp_path / "ydl_x.mp4.aria2").write_text("x")
+    (tmp_path / "ydl_x.f137.mp4.aria2").write_text("x")
+    d._remove_partials(str(tmp_path / "ydl_x.mp4"))
+    assert list(tmp_path.iterdir()) == []

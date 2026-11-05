@@ -52,7 +52,9 @@ services:
     logging: *default-logging
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8081/"]
+      # The image has no curl, and "/" answers 404 by design: check that the
+      # HTTP port accepts connections (busybox nc; IPv4 — it listens on 0.0.0.0).
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8081"]
       interval: 30s
       timeout: 10s
       retries: 3
