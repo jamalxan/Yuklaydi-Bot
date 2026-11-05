@@ -16,6 +16,7 @@ from bot.services.cache import (
     release_user_slot, store_url_key, store_video_for_shazam, try_acquire_user_slot,
 )
 from bot.services.downloader import detect_platform, has_cookies, normalize_url
+from bot.services.delivery import send_cached_video, split_file_ids
 from bot.texts import T, t
 
 router = Router()
@@ -140,11 +141,10 @@ async def _process_one_url(message: Message, url: str, lang: str,
     # Cache hit → instant send, no worker needed
     cached_id = await get_file_id(normalized, "720")
     if cached_id:
-        shazam_key = await store_video_for_shazam(cached_id, source_url=normalized)
+        shazam_key = await store_video_for_shazam(split_file_ids(cached_id)[0], source_url=normalized)
         url_key = await store_url_key(normalized)
-        await message.answer_video(
-            cached_id,
-            caption=CAPTION,
+        await send_cached_video(
+            message.bot, message.chat.id, cached_id, CAPTION, lang,
             reply_markup=video_result_keyboard(url_key, shazam_key, lang),
         )
         await _record_cache_hit(message.from_user.id, normalized, platform, "video",
@@ -230,9 +230,9 @@ async def cb_video_alt(callback: CallbackQuery, user_lang: str, user_repo: UserR
             await callback.message.answer_audio(cached_id, caption=CAPTION)
             kind = "audio"
         else:
-            shazam_key = await store_video_for_shazam(cached_id, source_url=url)
-            await callback.message.answer_video(
-                cached_id, caption=CAPTION,
+            shazam_key = await store_video_for_shazam(split_file_ids(cached_id)[0], source_url=url)
+            await send_cached_video(
+                callback.bot, callback.message.chat.id, cached_id, CAPTION, lang,
                 reply_markup=video_result_keyboard(url_key, shazam_key, lang),
             )
             kind = "video"

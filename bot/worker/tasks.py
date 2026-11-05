@@ -26,6 +26,8 @@ from bot.services.cache import (
 from bot.services.downloader import DownloadError, DownloadResult, download
 from bot.services.media import ffmpeg_path, get_temp_path, safe_delete
 from bot.services.recognizer import recognize
+from bot.services.delivery import join_file_ids, part_caption
+from bot.services.splitter import SplitError, remove_parts, split_video
 from bot.texts import T, error_text, t
 from bot.utils.text import esc
 
@@ -246,17 +248,19 @@ async def _try_instagram_photo(bot: Bot, chat_id: int, message_id: int, url: str
 
 async def _send_cached(bot: Bot, chat_id: int, message_id: int,
                        url: str, quality: str, file_id: str, lang: str) -> None:
-    """Send a cached file_id and clean up the progress message."""
+    """Send a cached file_id (or all parts of a split video) and clean up
+    the progress message."""
     if quality == "mp3":
         await _flood_retry(lambda: bot.send_audio(chat_id, audio=file_id, caption=CAPTION))
     else:
-        shazam_key = await store_video_for_shazam(file_id, source_url=url)
+        from bot.services.delivery import send_cached_video, split_file_ids
+        shazam_key = await store_video_for_shazam(split_file_ids(file_id)[0], source_url=url)
         url_key = await store_url_key(url)
         from bot.keyboards.inline import video_result_keyboard
         kb = video_result_keyboard(url_key, shazam_key, lang)
-        await _flood_retry(lambda: bot.send_video(
-            chat_id, video=file_id, caption=CAPTION,
-            supports_streaming=True, reply_markup=kb))
+        await send_cached_video(
+            bot, chat_id, file_id, CAPTION, lang, reply_markup=kb,
+            send=lambda **kw: _flood_retry(lambda: bot.send_video(**kw)))
     try:
         await bot.delete_message(chat_id, message_id)
     except Exception:
@@ -289,6 +293,7 @@ async def download_task(
     bot = _get_bot(ctx)
     own_bot = bot is not ctx.get("bot")
     temp_path: Optional[str] = None
+    split_source: Optional[str] = None
     lang = user_lang or settings.default_lang
     t_total_start = time.monotonic()
     sf_acquired = False
@@ -341,24 +346,43 @@ async def download_task(
                 actual_path = result.path
                 if not os.path.exists(actual_path) or result.size_bytes == 0:
                     raise DownloadError("Download produced empty or missing file", kind="generic")
+
+                # Too big for one upload: video is cut into parts at full
+                # quality (no re-encode); audio has no such fallback.
+                upload_paths = [actual_path]
                 if result.size_bytes > settings.max_file_bytes:
-                    raise DownloadError("Too large", kind="too_large")
+                    if quality == "mp3" or not settings.split_large_videos:
+                        raise DownloadError("Too large", kind="too_large")
+                    split_source = actual_path
+                    try:
+                        upload_paths = await split_video(actual_path, settings.max_file_bytes)
+                    except SplitError as e:
+                        logger.warning(f"Split failed for {url}: {e}")
+                        raise DownloadError("Too large", kind="too_large") from e
 
                 await _safe_edit(bot, chat_id, message_id, t("dl.uploading", lang))
                 await bot.send_chat_action(chat_id, "upload_voice" if quality == "mp3" else "upload_video")
 
                 t_up_start = time.monotonic()
-                input_file = FSInputFile(actual_path)
-                if quality == "mp3":
-                    sent = await _flood_retry(lambda: bot.send_audio(chat_id, audio=input_file, caption=CAPTION))
-                    media = sent.audio
-                else:
-                    sent = await _flood_retry(lambda: bot.send_video(
-                        chat_id, video=input_file, caption=CAPTION, supports_streaming=True))
-                    media = sent.video
-                if media is None:
-                    raise RuntimeError("Telegram response has no media object")
-                file_id = media.file_id
+                n_parts = len(upload_paths)
+                file_ids: list[str] = []
+                for i, part in enumerate(upload_paths, 1):
+                    input_file = FSInputFile(part)
+                    if n_parts > 1:
+                        await _try_edit(bot, chat_id, message_id,
+                                        t("dl.uploading_part", lang, i=i, n=n_parts))
+                    if quality == "mp3":
+                        sent = await _flood_retry(lambda: bot.send_audio(chat_id, audio=input_file, caption=CAPTION))
+                        media = sent.audio
+                    else:
+                        cap = part_caption(CAPTION, i, n_parts, lang)
+                        sent = await _flood_retry(lambda: bot.send_video(
+                            chat_id, video=input_file, caption=cap, supports_streaming=True))
+                        media = sent.video
+                    if media is None:
+                        raise RuntimeError("Telegram response has no media object")
+                    file_ids.append(media.file_id)
+                file_id = join_file_ids(file_ids)
                 t_upload = time.monotonic() - t_up_start
                 t_total = time.monotonic() - t_total_start
 
@@ -366,7 +390,7 @@ async def download_task(
                 await set_file_id(url, quality, file_id)
 
                 if quality != "mp3":
-                    shazam_key = await store_video_for_shazam(file_id, source_url=url)
+                    shazam_key = await store_video_for_shazam(file_ids[0], source_url=url)
                     url_key = await store_url_key(url)
                     from bot.keyboards.inline import video_result_keyboard
                     try:
@@ -407,11 +431,14 @@ async def download_task(
                     if await _try_instagram_photo(bot, chat_id, message_id, url):
                         return
                 logger.info(f"Download failed ({e.kind}): {str(e)[:200]}")
-                await _try_edit(bot, chat_id, message_id, error_text(e.kind, lang))
+                limit_mb = (settings.max_video_bytes if kind == "video" else settings.max_file_bytes) // 1048576
+                await _try_edit(bot, chat_id, message_id, error_text(e.kind, lang, mb=limit_mb))
             except Exception as e:
                 logger.error(f"Download task error: {e}", exc_info=True)
                 await _try_edit(bot, chat_id, message_id, t("err.generic", lang))
     finally:
+        if split_source:
+            remove_parts(split_source)
         if temp_path:
             base = os.path.splitext(temp_path)[0]
             for path in {temp_path, *(base + ext for ext in (".mp3", ".mp4", ".m4a", ".webm", ".opus", ".mkv"))}:

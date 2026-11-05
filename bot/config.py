@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     # validator below clamps the value so a copied .env can't promise 2 GB on
     # the cloud API (downloads would succeed and then fail on upload).
     max_file_mb: int = 50
+    # Videos bigger than the upload limit are NOT downgraded: they are cut
+    # without re-encoding (ffmpeg -c copy) into upload-sized parts and sent
+    # one after another. MAX_VIDEO_MB caps the total video download.
+    split_large_videos: bool = True
+    max_video_mb: int = 500
     max_audio_duration: int = 1200       # seconds; longer tracks are refused up-front
     download_dir: str = "./downloads"
     worker_concurrency: int = 5
@@ -112,20 +117,33 @@ class Settings(BaseSettings):
                 self.max_file_mb, LOCAL_API_MAX_MB,
             )
             self.max_file_mb = LOCAL_API_MAX_MB
-        # Big files need time: download + ffmpeg merge + upload through the
-        # Local Bot API. Rough floor: 300 s plus 1 s per MB above 50 MB.
-        needed = recommended_job_timeout(self.max_file_mb)
+        if self.max_video_mb > LOCAL_API_MAX_MB:
+            logging.getLogger("yuklaydi.config").warning(
+                "MAX_VIDEO_MB=%s capped to %s MB", self.max_video_mb, LOCAL_API_MAX_MB,
+            )
+            self.max_video_mb = LOCAL_API_MAX_MB
+        # Big files need time: download + ffmpeg merge + upload (one file via
+        # the Local Bot API, or several parts via the cloud API). Rough floor:
+        # 300 s plus 1 s per MB above 50 MB.
+        biggest = self.max_video_bytes // (1024 * 1024)
+        needed = recommended_job_timeout(biggest)
         if self.job_timeout < needed:
             logging.getLogger("yuklaydi.config").warning(
-                "JOB_TIMEOUT=%ss is short for MAX_FILE_MB=%s; large files may "
+                "JOB_TIMEOUT=%ss is short for %s MB videos; large files may "
                 "time out. Recommended: JOB_TIMEOUT>=%s", self.job_timeout,
-                self.max_file_mb, needed,
+                biggest, needed,
             )
         return self
 
     @property
     def max_file_bytes(self) -> int:
         return self.max_file_mb * 1024 * 1024
+
+    @property
+    def max_video_bytes(self) -> int:
+        """Largest video we download. Above max_file_bytes it is split."""
+        mb = max(self.max_file_mb, self.max_video_mb) if self.split_large_videos else self.max_file_mb
+        return mb * 1024 * 1024
 
     @property
     def use_local_api(self) -> bool:

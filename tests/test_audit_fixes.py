@@ -425,14 +425,15 @@ def test_ytdlp_opts_have_max_filesize():
     from bot.config import settings
     from bot.services.downloader import _build_opts
     opts = _build_opts("/tmp/x.mp4", "720")
-    assert opts["max_filesize"] == settings.max_file_bytes
+    # Video downloads may exceed one upload: the worker splits them.
+    assert opts["max_filesize"] == settings.max_video_bytes
     assert "filesize" in opts["format"]
 
 
 def test_check_limits_rejects_too_large_video():
     from bot.config import settings
     from bot.services.downloader import DownloadError, check_limits
-    info = {"duration": 60, "requested_formats": [{"filesize": settings.max_file_bytes + 1}]}
+    info = {"duration": 60, "requested_formats": [{"filesize": settings.max_video_bytes + 1}]}
     with pytest.raises(DownloadError) as ei:
         check_limits(info, "720")
     assert ei.value.kind == "too_large"
@@ -1177,7 +1178,7 @@ def test_too_large_video_is_delivered_at_lower_resolution():
     from bot.services import downloader as d
     _FakeYDL.calls = []
     opts = d.build_base_opts(outtmpl="/t/ydl_l.mp4", format=d._format_selector("720", None))
-    with patch.object(settings, "max_file_mb", 50), patch("yt_dlp.YoutubeDL", _LadderYDL):
+    with patch.object(settings, "max_file_mb", 50), patch.object(settings, "split_large_videos", False), patch("yt_dlp.YoutubeDL", _LadderYDL):
         info, _, _ = d.run_ydl("https://www.tiktok.com/@u/video/1", opts, "720")
     assert info["height"] == 360
     # 720 with light audio, then 480 (normal, light), then 360 fits.
@@ -1189,7 +1190,8 @@ def test_nothing_fits_still_reports_too_large():
     from bot.services import downloader as d
     _FakeYDL.calls = []
     opts = d.build_base_opts(outtmpl="/t/ydl_m.mp4", format=d._format_selector("720", None))
-    with patch.object(settings, "max_file_mb", 5), patch("yt_dlp.YoutubeDL", _LadderYDL), \
+    with patch.object(settings, "max_file_mb", 5), patch.object(settings, "split_large_videos", False), \
+         patch("yt_dlp.YoutubeDL", _LadderYDL), \
          pytest.raises(d.DownloadError) as ei:
         d.run_ydl("https://www.tiktok.com/@u/video/1", opts, "720")
     assert ei.value.kind == "too_large" and "dl" not in _FakeYDL.calls
@@ -1332,6 +1334,123 @@ def test_ladder_tries_lighter_audio_before_lower_video():
 
     _FakeYDL.calls = []
     opts = d.build_base_opts(outtmpl="/t/ydl_a.mp4", format=d._format_selector("720", None))
-    with patch.object(settings, "max_file_mb", 50), patch("yt_dlp.YoutubeDL", _AudioYDL):
+    with patch.object(settings, "max_file_mb", 50), patch.object(settings, "split_large_videos", False), patch("yt_dlp.YoutubeDL", _AudioYDL):
         info, _, _ = d.run_ydl("https://www.tiktok.com/@u/video/1", opts, "720")
     assert (info["height"], info["abr"]) == (480, 64)
+
+
+
+# ── Large videos: split at full quality instead of downgrading ──────────────
+
+def test_video_limit_allows_splitting_beyond_one_upload():
+    from bot.config import Settings
+    cloud = Settings(max_file_mb=50, max_video_mb=500, job_timeout=900)
+    assert cloud.max_file_bytes == 50 * 1024 * 1024
+    assert cloud.max_video_bytes == 500 * 1024 * 1024
+    off = Settings(max_file_mb=50, max_video_mb=500, split_large_videos=False)
+    assert off.max_video_bytes == off.max_file_bytes
+    assert Settings(max_video_mb=10_000).max_video_mb == 2000
+
+
+def test_720p_that_fits_the_video_limit_is_not_downgraded():
+    """92 MB 720p on the cloud API: kept at 720p (the worker splits it)."""
+    from bot.config import settings
+    from bot.services import downloader as d
+    _FakeYDL.calls = []
+    opts = d.build_base_opts(outtmpl="/t/ydl_s.mp4", format=d._format_selector("720", None))
+    with patch.object(settings, "max_file_mb", 50), patch.object(settings, "split_large_videos", True), \
+         patch.object(settings, "max_video_mb", 500), patch("yt_dlp.YoutubeDL", _LadderYDL):
+        info, _, _ = d.run_ydl("https://www.tiktok.com/@u/video/1", opts, "720")
+    assert info["height"] == 720
+
+
+def test_plan_parts_and_captions():
+    from bot.services.delivery import join_file_ids, part_caption, split_file_ids
+    from bot.services.splitter import plan_parts
+    mb = 1024 * 1024
+    assert plan_parts(92 * mb, 50 * mb) == 3          # 92 / (50 * 0.9) → 3
+    assert plan_parts(51 * mb, 50 * mb) == 2
+    assert plan_parts(500 * mb, 50 * mb) == 12
+    ids = ["AAA-_1", "BBB_2", "CCC3"]
+    assert split_file_ids(join_file_ids(ids)) == ids
+    assert split_file_ids("single") == ["single"]
+    assert part_caption("cap", 1, 1, "uz") == "cap"
+    assert part_caption("cap", 2, 3, "uz").endswith("2/3-qism")
+
+
+@pytest.mark.asyncio
+async def test_send_cached_video_sends_every_part_keyboard_on_last():
+    from bot.services.delivery import send_cached_video
+    sent = []
+
+    async def _send(**kw):
+        sent.append(kw)
+
+    await send_cached_video(None, 7, "id1|id2|id3", "cap", "en", reply_markup="KB", send=_send)
+    assert [k["video"] for k in sent] == ["id1", "id2", "id3"]
+    assert [k["reply_markup"] for k in sent] == [None, None, "KB"]
+    assert sent[0]["caption"].endswith("Part 1/3")
+
+
+def _make_test_video(path, seconds=12):
+    import subprocess
+    from bot.services.media import ffmpeg_path
+    subprocess.run([
+        ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", f"testsrc2=size=640x360:rate=25:duration={seconds}",
+        "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
+        "-c:v", "libx264", "-preset", "ultrafast", "-g", "25", "-b:v", "2M",
+        "-c:a", "aac", "-shortest", path,
+    ], check=True)
+
+
+@pytest.mark.asyncio
+async def test_split_video_parts_fit_and_keep_codec(tmp_path):
+    import json
+    import os
+    import subprocess
+    from bot.services.media import ffprobe_path, probe_duration
+    from bot.services.splitter import part_paths, remove_parts, split_video
+
+    src = str(tmp_path / "ydl_abc.mp4")
+    _make_test_video(src)
+    size = os.path.getsize(src)
+    limit = size // 3 + 1
+
+    parts = await split_video(src, limit)
+    assert len(parts) >= 3 and parts == part_paths(src)
+    assert all(os.path.getsize(p) <= limit for p in parts)
+    total = sum([await probe_duration(p) for p in parts])
+    assert abs(total - await probe_duration(src)) < 1.0      # nothing lost
+    probe = json.loads(subprocess.run(
+        [ffprobe_path(), "-v", "error", "-show_streams", "-of", "json", parts[0]],
+        capture_output=True, text=True).stdout)
+    codecs = {st["codec_type"]: st for st in probe["streams"]}
+    assert codecs["video"]["codec_name"] == "h264" and codecs["video"]["height"] == 360  # same quality
+    assert codecs["audio"]["codec_name"] == "aac"
+
+    remove_parts(src)
+    assert part_paths(src) == []
+
+
+@pytest.mark.asyncio
+async def test_split_video_small_file_untouched(tmp_path):
+    import os
+    from bot.services.splitter import part_paths, split_video
+    src = str(tmp_path / "ydl_small.mp4")
+    _make_test_video(src, seconds=2)
+    assert await split_video(src, os.path.getsize(src)) == [src]
+    assert part_paths(src) == []
+
+
+def test_download_sync_accepts_video_above_one_upload(tmp_path):
+    """A 60 MB video on the cloud API is returned for splitting, not rejected."""
+    from bot.config import settings
+    from bot.services import downloader as d
+    out = tmp_path / "ydl_big.mp4"
+    out.write_bytes(b"\0" * (60 * 1024 * 1024))
+    with patch.object(settings, "max_file_mb", 50), patch.object(settings, "split_large_videos", True),          patch.object(settings, "max_video_mb", 500),          patch.object(d, "run_ydl", return_value=({"filepath": str(out)}, 0.1, 0.2)):
+        r = d._download_sync("https://youtu.be/x", str(out), "720")
+        assert r.size_bytes == 60 * 1024 * 1024
+        with patch.object(settings, "split_large_videos", False), pytest.raises(d.DownloadError):
+            d._download_sync("https://youtu.be/x", str(out), "720")

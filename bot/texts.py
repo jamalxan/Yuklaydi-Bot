@@ -18,6 +18,8 @@ T: dict[str, dict[str, str]] = {
     "dl.queued":      {"uz": "📋 Navbatda...", "ru": "📋 В очереди...", "en": "📋 Queued..."},
     "dl.too_many_links": {"uz": "ℹ️ Bitta xabardan faqat birinchi {n} ta havola yuklanadi.", "ru": "ℹ️ Из одного сообщения скачиваются только первые {n} ссылок.", "en": "ℹ️ Only the first {n} links of a message are downloaded."},
     "dl.uploading":   {"uz": "📤 Yuborilmoqda...", "ru": "📤 Отправляется...", "en": "📤 Uploading..."},
+    "dl.uploading_part": {"uz": "📤 Yuborilmoqda: {i}/{n}-qism...", "ru": "📤 Отправляется часть {i}/{n}...", "en": "📤 Uploading part {i}/{n}..."},
+    "dl.part":        {"uz": "🎞 {i}/{n}-qism", "ru": "🎞 Часть {i}/{n}", "en": "🎞 Part {i}/{n}"},
     "dl.done":        {"uz": "✅ Tayyor!", "ru": "✅ Готово!", "en": "✅ Done!"},
     "dl.recognizing": {"uz": "🎧 Musiqa aniqlanmoqda...", "ru": "🎧 Распознаётся музыка...", "en": "🎧 Recognizing music..."},
 
@@ -181,7 +183,7 @@ def t(key: str, lang: str | None = None, **fmt) -> str:
     return text.format(**fmt) if fmt else text
 
 
-def error_text(kind: str, lang: str | None) -> str:
+def error_text(kind: str, lang: str | None, **fmt) -> str:
     """Localized message for a DownloadError.kind (unknown kinds → generic)."""
     key = f"err.{kind}"
-    return t(key if key in T else "err.generic", lang)
+    return t(key if key in T else "err.generic", lang, **fmt)

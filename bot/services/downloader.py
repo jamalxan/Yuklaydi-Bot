@@ -344,7 +344,7 @@ VIDEO_FORMAT_SORT = ("res", "vcodec:h264", "acodec:aac")
 def _build_opts(output_path: str, quality: str) -> dict:
     opts = build_base_opts(
         outtmpl=output_path,
-        format=_format_selector(quality, None if quality == "mp3" else settings.max_file_bytes),
+        format=_format_selector(quality, None if quality == "mp3" else settings.max_video_bytes),
         merge_output_format="mp4",
         # Speed. Kept modest (not 16) because hammering a throttled HLS host
         # with many parallel connections triggers more resets/timeouts than it
@@ -378,8 +378,9 @@ def _build_opts(output_path: str, quality: str) -> dict:
         }]
         opts["outtmpl"] = strip_media_ext(output_path)
     else:
-        # Abort mid-transfer if the server sends more than we could upload.
-        opts["max_filesize"] = settings.max_file_bytes
+        # Abort mid-transfer if the server sends more than we could deliver
+        # (bigger than one upload is fine: the worker splits it into parts).
+        opts["max_filesize"] = settings.max_video_bytes
         # Among formats the selector already allows (height/size/protocol caps
         # still win), prefer h264 + aac: they play inline in Telegram, on iOS
         # and on older Android without a transcode; vp9/av1 often do not.
@@ -439,7 +440,7 @@ def check_limits(info: dict, quality: str) -> None:
             raise DownloadError("Estimated MP3 too large", kind="too_large")
         return
     est = estimate_size(info)
-    if est is not None and est > settings.max_file_bytes:
+    if est is not None and est > settings.max_video_bytes:
         raise DownloadError(f"Estimated size {est}B > limit", kind="too_large")
 
 
@@ -605,7 +606,7 @@ def run_ydl(url: str, opts: dict, quality: Optional[str] = None) -> tuple[dict, 
                     except DownloadError as e:
                         if e.kind != "too_large" or not fallback_heights(quality):
                             raise
-                        info = _reselect_smaller(ydl, info, quality, settings.max_file_bytes)
+                        info = _reselect_smaller(ydl, info, quality, settings.max_video_bytes)
                 t_extract = time.monotonic() - t0
                 t1 = time.monotonic()
                 processed = ydl.process_ie_result(info, download=True)
@@ -626,7 +627,8 @@ def _download_sync(url: str, output_path: str, quality: str) -> DownloadResult:
     expected = (strip_media_ext(output_path) + ".mp3") if quality == "mp3" else output_path
     out = resolve_output_path(info, expected)
     size = os.path.getsize(out) if os.path.isfile(out) else 0
-    if size > settings.max_file_bytes:
+    limit = settings.max_file_bytes if quality == "mp3" else settings.max_video_bytes
+    if size > limit:
         raise DownloadError("Too large", kind="too_large")
     return DownloadResult(out, t_extract, t_download, size)
 

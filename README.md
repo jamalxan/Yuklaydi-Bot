@@ -116,8 +116,16 @@ Bot API port is bound to `127.0.0.1` only.
 Telegram's cloud Bot API caps uploads at 50 MB. Larger files go through the
 `telegram-bot-api` container (`LOCAL_API_URL`, needs `TELEGRAM_API_ID` /
 `TELEGRAM_API_HASH` from my.telegram.org). Defaults: `MAX_FILE_MB=500`,
-`JOB_TIMEOUT=900`. If a video is bigger than the limit, the bot sends a lower
-resolution (480p → 360p → 240p) that fits.
+`JOB_TIMEOUT=900`.
+
+Videos bigger than one upload (50 MB on the cloud API) keep the quality the
+user picked: the finished MP4 is cut with `ffmpeg -c copy` (no re-encode,
+seconds per GB) into equal parts that each fit, sent as "Part 1/N", "Part
+2/N"… and cached together, so the next request re-sends all parts instantly.
+`MAX_VIDEO_MB` (default 500) caps the total video download;
+`SPLIT_LARGE_VIDEOS=false` restores the old behaviour (a lower resolution
+480p → 360p → 240p that fits one upload). Only above `MAX_VIDEO_MB` does the
+bot fall back to a lower resolution.
 
 Disk: each in-flight download can take ~2× the file size (streams + merged
 file). Budget about `replicas × YT_DLP_WORKER_CONCURRENCY × 2 × MAX_FILE_MB`
