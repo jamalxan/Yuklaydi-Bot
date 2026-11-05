@@ -122,14 +122,20 @@ async def main():
                                _queue_name="arq:queue:recognition")
 
         async def _recog_done():
-            # done when worker replaced the progress message (deleted → photo card)
+            # Done only when the worker DELETED the progress message (it does
+            # that right before posting the song card). Probe with unique text
+            # so "message is not modified" can never fire: with a constant
+            # probe text the first call raised "not modified" and this check
+            # passed before the worker had even started (false positive).
+            # On a worker error the message is edited to an error text and
+            # stays editable, so this correctly keeps returning False.
             try:
-                await bot.edit_message_text("🎧 [E2E] test 5: recognizing...",
+                await bot.edit_message_text(f"🎧 [E2E] test 5: probe {time.monotonic():.3f}",
                                             chat_id=CHAT_ID, message_id=m5.message_id)
-                return False  # still editable with same text? then not replaced yet
+                return False
             except Exception as e:
                 s = str(e).lower()
-                return "not found" in s or "message to edit" in s or "not modified" in s
+                return "not found" in s or "message to edit" in s
         rec = await wait_for(_recog_done, timeout=120, label="recognition")
         results["recognition"] = bool(rec)
         print(f"  -> recognition finished: {bool(rec)}")

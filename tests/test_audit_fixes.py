@@ -1625,3 +1625,29 @@ def test_no_proxy_url_means_direct_everywhere():
         d.run_ydl("https://www.tiktok.com/@u/video/1", d.build_base_opts(outtmpl="/t/px2.mp4"), "720")
     assert _ProxyYDL.seen == [None]
     assert d.proxy_for("https://www.tiktok.com/@u/video/1") is None
+
+
+# ── Local Bot API file store must be readable by the app user ────────────────
+# aiogram/telegram-bot-api writes /var/lib/telegram-bot-api/<token>/ as uid/gid
+# 101 with 0750 dirs and 0640 files. recognize_task reads those files straight
+# from disk (getFile with is_local=True), so every app service needs gid 101 as
+# a supplementary group — and the entrypoint must not throw it away when it
+# drops root (`setpriv --init-groups` resets groups to /etc/group's view).
+
+def test_compose_app_services_get_bot_api_gid():
+    import yaml
+    compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+    for name in ("bot", "worker", "worker-music", "worker-recognition"):
+        svc = compose["services"][name]
+        assert "101" in [str(g) for g in svc.get("group_add", [])], name
+        assert any(v.startswith("telegram_data:/var/lib/telegram-bot-api") for v in svc["volumes"]), name
+
+
+def test_entrypoint_preserves_runtime_supplementary_groups():
+    src = (ROOT / "docker-entrypoint.sh").read_text(encoding="utf-8")
+    assert "setpriv" in src
+    assert "id -G" in src
+    groups_line = next(l for l in src.splitlines() if '--groups="app$extra"' in l)
+    assert groups_line.strip() == 'exec setpriv --reuid=app --regid=app --groups="app$extra" "$@"'
+    # The group-preserving branch must come before the --init-groups fallback.
+    assert src.index(groups_line) < src.index("exec setpriv --reuid=app --regid=app --init-groups")

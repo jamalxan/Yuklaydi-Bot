@@ -16,6 +16,12 @@ x-app: &app
   env_file: .env
   logging: *default-logging
   restart: unless-stopped
+  # The Local Bot API (aiogram/telegram-bot-api) writes its file store as
+  # uid/gid 101 with 0750 dirs and 0640 files. Our services run as uid 10001,
+  # so they need gid 101 as a supplementary group to read voice/video files
+  # for recognition (getFile with is_local=True reads straight from disk).
+  group_add:
+    - "101"
   volumes:
     - downloads:/downloads
     - telegram_data:/var/lib/telegram-bot-api:ro
