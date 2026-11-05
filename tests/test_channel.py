@@ -35,16 +35,54 @@ def _no_membership_cache():
 # ── Skip commands always pass through ────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_skip_start_command():
+async def test_start_runs_and_then_shows_join_prompt_to_non_member():
     from bot.middlewares.channel import ChannelCheckMiddleware
     mw = ChannelCheckMiddleware()
     msg = _make_message("/start")
+    msg.bot.get_chat_member = AsyncMock(return_value=MagicMock(status="left"))
+    get_c, set_c = _no_membership_cache()
 
-    with patch("bot.middlewares.channel._get_channel_id", new=AsyncMock(return_value="-100123456789")):
+    with patch("bot.middlewares.channel._get_channel_id", new=AsyncMock(return_value="-100123456789")), \
+         get_c, set_c, \
+         patch.object(ChannelCheckMiddleware, "_send_join_prompt", new=AsyncMock()) as prompt:
+        result = await mw(_noop_handler, msg, {"user_lang": "uz"})
+
+    assert result == "handled"  # welcome / language picker still shown
+    prompt.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_start_member_gets_no_join_prompt():
+    from bot.middlewares.channel import ChannelCheckMiddleware
+    mw = ChannelCheckMiddleware()
+    msg = _make_message("/start")
+    msg.bot.get_chat_member = AsyncMock(return_value=MagicMock(status="member"))
+    get_c, set_c = _no_membership_cache()
+
+    with patch("bot.middlewares.channel._get_channel_id", new=AsyncMock(return_value="-100123456789")), \
+         get_c, set_c, \
+         patch.object(ChannelCheckMiddleware, "_send_join_prompt", new=AsyncMock()) as prompt:
         result = await mw(_noop_handler, msg, {"user_lang": "uz"})
 
     assert result == "handled"
-    msg.answer.assert_not_called()
+    prompt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_start_check_error_fails_open_without_prompt():
+    from bot.middlewares.channel import ChannelCheckMiddleware
+    mw = ChannelCheckMiddleware()
+    msg = _make_message("/start")
+    msg.bot.get_chat_member = AsyncMock(side_effect=RuntimeError("chat not found"))
+    get_c, set_c = _no_membership_cache()
+
+    with patch("bot.middlewares.channel._get_channel_id", new=AsyncMock(return_value="-100123456789")), \
+         get_c, set_c, \
+         patch.object(ChannelCheckMiddleware, "_send_join_prompt", new=AsyncMock()) as prompt:
+        result = await mw(_noop_handler, msg, {"user_lang": "uz"})
+
+    assert result == "handled"
+    prompt.assert_not_called()
 
 
 @pytest.mark.asyncio

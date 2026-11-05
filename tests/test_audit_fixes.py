@@ -1081,7 +1081,7 @@ def test_run_ydl_retries_youtube_403_with_fallback_clients(tmp_path):
     opts = d.build_base_opts(outtmpl=str(tmp_path / "ydl_x.mp4"))
     with patch("yt_dlp.YoutubeDL", _FakeYDL):
         info, _, _ = d.run_ydl("https://www.youtube.com/watch?v=abc", opts, "720")
-    assert _FakeYDL.calls == [["default"], list(d.YOUTUBE_FALLBACK_CLIENTS)]
+    assert _FakeYDL.calls == [["default"], list(d.YOUTUBE_FALLBACK_CLIENT_SETS[0])]
     assert not part.exists(), "stale .part from the failed attempt must be removed"
 
 
@@ -1180,7 +1180,8 @@ def test_too_large_video_is_delivered_at_lower_resolution():
     with patch.object(settings, "max_file_mb", 50), patch("yt_dlp.YoutubeDL", _LadderYDL):
         info, _, _ = d.run_ydl("https://www.tiktok.com/@u/video/1", opts, "720")
     assert info["height"] == 360
-    assert _FakeYDL.calls == [480, 360, "dl"]
+    # 720 with light audio, then 480 (normal, light), then 360 fits.
+    assert _FakeYDL.calls == [720, 480, 480, 360, "dl"]
 
 
 def test_nothing_fits_still_reports_too_large():
@@ -1294,3 +1295,43 @@ async def test_genius_result_for_other_song_is_ignored():
 
     with patch.object(settings, "genius_token", "x"), patch("lyricsgenius.Genius", _G):
         assert await L._search_genius("Ketma", "Ummon") is None
+
+
+
+def test_youtube_403_tries_web_embedded_then_legacy_clients():
+    import yt_dlp
+    from bot.services import downloader as d
+
+    class _AllButLegacy403(_FakeYDL):
+        def process_ie_result(self, info, download=True):
+            clients = self.opts["extractor_args"]["youtube"]["player_client"]
+            _FakeYDL.calls.append(clients)
+            if clients != list(d.YOUTUBE_FALLBACK_CLIENT_SETS[-1]):
+                raise yt_dlp.utils.DownloadError("ERROR: ffmpeg exited with code 3436169992")
+            return info
+
+    _FakeYDL.calls = []
+    with patch("yt_dlp.YoutubeDL", _AllButLegacy403):
+        d.run_ydl("https://youtu.be/abc", d.build_base_opts(outtmpl="/t/ydl_q.mp4"), "720")
+    assert _FakeYDL.calls == [["default"], ["web_embedded"], ["android", "web_safari", "web"]]
+
+
+def test_ladder_tries_lighter_audio_before_lower_video():
+    """43-minute video: 480p + 129 kbps audio = 75 MB, 480p + 48 kbps = 49.6 MB."""
+    import re
+    from bot.config import settings
+    from bot.services import downloader as d
+
+    class _AudioYDL(_LadderYDL):
+        def _pick(self):
+            h = int(re.search(r"height<=(\d+)", self.format_selector).group(1))
+            abr = int(re.search(r"abr<=\?(\d+)", self.format_selector).group(1))
+            video = {720: 50.7, 480: 34.0, 360: 22.5, 240: 12.7}[h]
+            audio = 41.4 if abr >= 128 else 15.6
+            return {"duration": 2558, "filesize": int((video + audio) * 1e6), "height": h, "abr": abr}
+
+    _FakeYDL.calls = []
+    opts = d.build_base_opts(outtmpl="/t/ydl_a.mp4", format=d._format_selector("720", None))
+    with patch.object(settings, "max_file_mb", 50), patch("yt_dlp.YoutubeDL", _AudioYDL):
+        info, _, _ = d.run_ydl("https://www.tiktok.com/@u/video/1", opts, "720")
+    assert (info["height"], info["abr"]) == (480, 64)
