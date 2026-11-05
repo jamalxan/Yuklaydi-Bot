@@ -1,7 +1,7 @@
 aiogram==3.13.1
 aiohttp==3.10.11
 
-yt-dlp==2026.7.4
+yt-dlp==2026.10.26
 shazamio==0.7.0
 lyricsgenius==3.0.1
 instaloader>=4.13  # Instagram photo-post fallback

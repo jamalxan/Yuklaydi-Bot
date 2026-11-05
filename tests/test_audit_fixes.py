@@ -1482,3 +1482,53 @@ def test_aria2_control_file_is_junk(tmp_path):
     (tmp_path / "ydl_x.f137.mp4.aria2").write_text("x")
     d._remove_partials(str(tmp_path / "ydl_x.mp4"))
     assert list(tmp_path.iterdir()) == []
+
+
+# ── aria2c only pays off on big streams ──────────────────────────────────────
+# googlevideo throttles Range-less requests to ~30 KB/s. aria2c sends its
+# first request without a Range header, so a 300 KB audio track took ~10 s
+# and a 10 MB stream ~12 s (vs <1 s / ~4 s for yt-dlp's chunked native
+# downloader). On a 68 MB stream aria2c still wins 2x (20 s vs 45 s).
+
+class _SizedYDL(_FakeYDL):
+    """Records which downloader was active when the download pass ran."""
+    sizes: list = []
+    seen: list = []
+
+    def extract_info(self, url, download=False):
+        fmts = [{"format_id": str(i), "filesize": s} for i, s in enumerate(_SizedYDL.sizes)]
+        return {"duration": 10, "filesize": sum(x or 0 for x in _SizedYDL.sizes), "requested_formats": fmts}
+
+    def process_ie_result(self, info, download=True):
+        _SizedYDL.seen.append(self.opts.get("external_downloader"))
+        return info
+
+
+@pytest.mark.parametrize("sizes, expected", [
+    ([300_000, 220_000], None),                        # short clip: native
+    ([10 * 1024 * 1024, 1_000_000], None),             # mid-size: native
+    ([68 * 1024 * 1024, 9_000_000], "aria2c"),         # big stream: aria2c
+    ([None, 1_000], "aria2c"),                         # unknown size: keep aria2c
+])
+def test_run_ydl_uses_native_downloader_for_small_streams(sizes, expected):
+    from bot.services import downloader as d
+    _SizedYDL.sizes, _SizedYDL.seen = sizes, []
+    opts = d.build_base_opts(outtmpl="/t/sz.mp4", external_downloader="aria2c")
+    with patch("yt_dlp.YoutubeDL", _SizedYDL):
+        d.run_ydl("https://www.youtube.com/watch?v=abc", opts, "720")
+    assert _SizedYDL.seen == [expected]
+    assert opts.get("external_downloader") == "aria2c", "caller's opts must not be mutated"
+
+
+def test_run_ydl_single_format_size_decides_downloader():
+    from bot.services import downloader as d
+
+    class _Single(_SizedYDL):
+        def extract_info(self, url, download=False):
+            return {"duration": 10, "filesize_approx": 2_000_000}
+
+    _SizedYDL.seen = []
+    with patch("yt_dlp.YoutubeDL", _Single):
+        d.run_ydl("https://www.tiktok.com/@u/video/1",
+                  d.build_base_opts(outtmpl="/t/sz1.mp4", external_downloader="aria2c"), "720")
+    assert _SizedYDL.seen == [None]

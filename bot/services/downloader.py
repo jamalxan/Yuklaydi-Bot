@@ -585,6 +585,39 @@ def _reselect_smaller(ydl, info: dict, quality: str, max_bytes: int) -> dict:
     raise DownloadError("No format fits the upload limit", kind="too_large")
 
 
+# aria2c's first request carries no Range header, and googlevideo serves
+# Range-less requests at ~30 KB/s (measured: 300 KB in 9.6 s, 10 MB in 318 s
+# via curl). yt-dlp's native downloader always fetches in Range chunks and is
+# not throttled. aria2c only recovers the loss when there are many pieces to
+# parallelise: 68 MB took 20 s with aria2c vs 45 s native, while 10 MB took
+# 12 s vs ~4 s and a 300 KB audio track 10 s vs <1 s. Streams below this
+# size therefore go through the native downloader.
+ARIA2C_MIN_BYTES = 25 * 1024 * 1024
+
+
+def expected_stream_bytes(info: dict) -> Optional[int]:
+    """Size of the largest stream yt-dlp is about to fetch, or None if unknown."""
+    fmts = info.get("requested_formats") or [info]
+    sizes = [f.get("filesize") or f.get("filesize_approx") for f in fmts]
+    if not sizes or not all(isinstance(s, (int, float)) and s > 0 for s in sizes):
+        return None
+    return int(max(sizes))
+
+
+def _pick_downloader(params: dict, info: dict) -> None:
+    """Drop the external downloader for this run when the streams are small.
+
+    *params* is the very dict handed to ``YoutubeDL`` (it keeps a reference,
+    not a copy) and is consulted again at download time, so the switch takes
+    effect without re-extracting.
+    """
+    if not params.get("external_downloader"):
+        return
+    size = expected_stream_bytes(info)
+    if size is not None and size < ARIA2C_MIN_BYTES:
+        params["external_downloader"] = None
+
+
 def run_ydl(url: str, opts: dict, quality: Optional[str] = None) -> tuple[dict, float, float]:
     """Two-pass yt-dlp run shared by every download path.
 
@@ -594,7 +627,7 @@ def run_ydl(url: str, opts: dict, quality: Optional[str] = None) -> tuple[dict, 
     On a YouTube 403 the whole run is retried once with the fallback clients.
     Returns (info, t_extract, t_download); raises DownloadError.
     """
-    attempts = [opts]
+    attempts = [dict(opts)]  # copy: _pick_downloader edits the dict yt-dlp holds
     if platform_for_host(safe_hostname(url) or "") == "youtube":
         for clients in YOUTUBE_FALLBACK_CLIENT_SETS:
             fallback = dict(opts)
@@ -616,6 +649,7 @@ def run_ydl(url: str, opts: dict, quality: Optional[str] = None) -> tuple[dict, 
                             raise
                         info = _reselect_smaller(ydl, info, quality, settings.max_video_bytes)
                 t_extract = time.monotonic() - t0
+                _pick_downloader(o, info)
                 t1 = time.monotonic()
                 processed = ydl.process_ie_result(info, download=True)
                 return (processed if isinstance(processed, dict) else info,
