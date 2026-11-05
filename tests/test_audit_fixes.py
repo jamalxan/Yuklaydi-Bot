@@ -853,3 +853,42 @@ def test_no_suitable_extractor_is_unsupported():
 def test_strip_media_ext(path, expected):
     from bot.services.downloader import strip_media_ext
     assert strip_media_ext(path) == expected
+
+
+# ── Admin is never walled by the required-channel check ─────────────────────
+
+@pytest.mark.asyncio
+async def test_channel_wall_never_blocks_admin_fsm_text():
+    from aiogram.types import Message
+    from bot.config import settings
+    from bot.middlewares.channel import ChannelCheckMiddleware
+
+    admin = next(iter(settings.admin_ids))
+    msg = MagicMock(spec=Message)
+    msg.from_user = SimpleNamespace(id=admin)
+    msg.text = "-1001234567890"          # e.g. channel ID typed in the admin FSM
+    handler = AsyncMock(return_value="handled")
+    channel_lookup = AsyncMock(return_value="-1001234567890")
+    with patch("bot.middlewares.channel._get_channel_id", channel_lookup):
+        assert await ChannelCheckMiddleware()(handler, msg, {}) == "handled"
+    channel_lookup.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_channel_wall_still_blocks_non_member_user():
+    from aiogram.types import Message
+    from bot.middlewares.channel import ChannelCheckMiddleware
+
+    msg = MagicMock(spec=Message)
+    msg.from_user = SimpleNamespace(id=424242)
+    msg.text = "https://youtu.be/x"
+    msg.answer = AsyncMock()
+    bot = MagicMock()
+    bot.get_chat_member = AsyncMock(return_value=SimpleNamespace(status="left"))
+    msg.bot = bot
+    handler = AsyncMock()
+    with patch("bot.middlewares.channel._get_channel_id", AsyncMock(return_value="-100123")), \
+         patch("bot.middlewares.channel.get_cached_membership", AsyncMock(return_value=None)), \
+         patch("bot.middlewares.channel.set_cached_membership", AsyncMock()):
+        await ChannelCheckMiddleware()(handler, msg, {"bot": bot, "user_lang": "uz"})
+    handler.assert_not_called()

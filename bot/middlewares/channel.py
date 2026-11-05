@@ -7,6 +7,7 @@ from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery, InlineKeyboardButton, Message, TelegramObject
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from bot.config import settings
 from bot.db.repo import SettingRepo
 from bot.db.session import async_session_factory
 from bot.services.cache import (
@@ -59,6 +60,14 @@ class ChannelCheckMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: Dict[str, Any],
     ) -> Any:
+        # Admins are never walled: their FSM steps (broadcast text, ban ID,
+        # channel ID, welcome text) are plain messages, and an admin who is
+        # not a member of the channel would otherwise be locked out of the
+        # panel — including while setting the channel for the first time.
+        from_user = getattr(event, "from_user", None)
+        if from_user is not None and from_user.id in settings.admin_ids:
+            return await handler(event, data)
+
         is_callback = isinstance(event, CallbackQuery)
         if is_callback:
             if (event.data or "").startswith(_SKIP_CALLBACK_PREFIXES):
