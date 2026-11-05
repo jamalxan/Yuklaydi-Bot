@@ -1222,3 +1222,75 @@ def test_too_large_message_shows_current_limit():
     from bot.texts import t
     with patch.object(settings, "max_file_mb", 500):
         assert "500" in t("err.too_large", "uz")
+
+
+# ── Lyrics (found in live bot run: Genius crashed, Uzbek titles never matched) ─
+
+@pytest.mark.parametrize("title,artist,expected", [
+    ("Sherali Juraev - Gulbadan Rasmiy Matnli ()", "Sherali Juraev Team", ("Gulbadan", "Sherali Juraev")),
+    ("Yulduz Usmonova - Aldama (Official Video)", "Yulduz Usmonova", ("Aldama", "Yulduz Usmonova")),
+    ("Ummon - Ketma | Official Music Video", "UMMON", ("Ketma", "Ummon")),
+    ("Shape of You [Official Video]", "Ed Sheeran", ("Shape of You", "Ed Sheeran")),
+    ("Song (feat. Someone) (Lyrics)", "Artist - Topic", ("Song", "Artist")),
+    ("Track (Remix)", "DJ", ("Track (Remix)", "DJ")),
+])
+def test_clean_search_query_handles_youtube_titles(title, artist, expected):
+    from bot.services.lyrics import _clean_search_query
+    assert _clean_search_query(title, artist) == expected
+
+
+@pytest.mark.parametrize("a,b,same", [
+    ("Sherali Juraev", "Sherali Jo'rayev", True),
+    ("Шерали Жураев", "Sherali Juraev", True),
+    ("Yulduz Usmonova", "Yulduz Usmonova", True),
+    ("Massa", "Ummon", False),
+    ("Ed Sheeran", "Ed", False),
+])
+def test_artist_similar(a, b, same):
+    from bot.services.lyrics import artist_similar
+    assert artist_similar(a, b) is same
+
+
+def test_wrong_song_is_rejected():
+    from bot.services.lyrics import is_same_song
+    assert is_same_song("Gulbadan", "Sherali Jo'rayev", "Gulbadan", "Sherali Juraev")
+    assert not is_same_song("Freestyle 3", "Massa", "Ketma", "Ummon")
+    assert not is_same_song("Biz ne dertler", "Yulduz Usmonova", "Aldama", "Yulduz Usmonova")
+
+
+def test_clean_lyrics_strips_genius_page_chrome():
+    from bot.services.lyrics import clean_lyrics
+    raw = "1 ContributorTranslationsEnglishGulbadan Lyrics[Kuplet]\nKuylarim yetgaymikan\nYou might also like\nsatr2 12Embed"
+    assert clean_lyrics(raw) == "Kuylarim yetgaymikan\n\nsatr2"
+
+
+def test_genius_constructed_with_supported_kwargs_only():
+    """Genius(user_agent=...) raised TypeError on lyricsgenius 3.0.1 — every lookup failed."""
+    import inspect
+    import re
+    import lyricsgenius
+
+    sig = inspect.signature(lyricsgenius.Genius.__init__)
+    src = (ROOT / "bot" / "services" / "lyrics.py").read_text(encoding="utf-8")
+    for call in re.findall(r"lyricsgenius\.Genius\((.*?)\)\n", src, flags=re.S):
+        for kw in re.findall(r"(\w+)=", call):
+            assert kw in sig.parameters, f"Genius() does not accept {kw!r}"
+
+
+@pytest.mark.asyncio
+async def test_genius_result_for_other_song_is_ignored():
+    from bot.config import settings
+    from bot.services import lyrics as L
+
+    other = SimpleNamespace(title="Freestyle 3", artist="Massa", lyrics="la la la " * 20)
+
+    class _G:
+        def __init__(self, *a, **k):
+            self._session = SimpleNamespace(headers={})
+            self.skip_non_songs = True
+
+        def search_song(self, *a, **k):
+            return other
+
+    with patch.object(settings, "genius_token", "x"), patch("lyricsgenius.Genius", _G):
+        assert await L._search_genius("Ketma", "Ummon") is None
