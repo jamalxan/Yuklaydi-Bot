@@ -892,3 +892,141 @@ async def test_channel_wall_still_blocks_non_member_user():
          patch("bot.middlewares.channel.set_cached_membership", AsyncMock()):
         await ChannelCheckMiddleware()(handler, msg, {"bot": bot, "user_lang": "uz"})
     handler.assert_not_called()
+
+
+# ── AudD fallback (only with AUDD_TOKEN) ─────────────────────────────────────
+
+def test_parse_audd_result_full_and_unsafe_urls():
+    from bot.services.recognizer import _parse_audd_result
+    r = _parse_audd_result({
+        "title": "Song", "artist": "Artist",
+        "apple_music": {"url": "https://music.apple.com/x", "artwork": {"url": "https://img/{w}x{h}.jpg"}},
+        "spotify": {"external_urls": {"spotify": "javascript:alert(1)"}},
+    })
+    assert (r.title, r.artist, r.source) == ("Song", "Artist", "audd")
+    assert r.coverart == "https://img/500x500.jpg"
+    assert r.apple_url == "https://music.apple.com/x"
+    assert r.spotify_url is None, "non-https link must never become a button"
+    assert _parse_audd_result({"title": ""}) is None
+
+
+@pytest.mark.asyncio
+async def test_audd_not_called_without_token(tmp_path):
+    from bot.config import settings
+    from bot.services import recognizer
+    media = tmp_path / "a.mp3"
+    media.write_bytes(b"x")
+    with patch.object(settings, "audd_token", ""), \
+         patch.object(recognizer, "probe_duration", AsyncMock(return_value=30.0)), \
+         patch.object(recognizer, "_try_recognize_snippet", AsyncMock(return_value=None)), \
+         patch.object(recognizer, "_try_audd", AsyncMock()) as audd:
+        assert await recognizer.recognize(str(media)) is None
+    audd.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_audd_used_when_shazam_misses(tmp_path):
+    from bot.config import settings
+    from bot.services import recognizer
+    media = tmp_path / "a.mp3"
+    media.write_bytes(b"x")
+    found = recognizer.SongResult("T", "A", source="audd")
+    with patch.object(settings, "audd_token", "tok"), \
+         patch.object(recognizer, "probe_duration", AsyncMock(return_value=30.0)), \
+         patch.object(recognizer, "_try_recognize_snippet", AsyncMock(return_value=None)), \
+         patch.object(recognizer, "_try_audd", AsyncMock(return_value=found)) as audd:
+        assert await recognizer.recognize(str(media)) is found
+    audd.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_try_audd_never_raises_on_network_error(tmp_path):
+    from bot.services import recognizer
+    snip = tmp_path / "s.wav"
+    snip.write_bytes(b"\x00" * 5000)
+
+    class _Boom:
+        def __init__(self, *a, **k):
+            raise OSError("network down")
+
+    with patch("aiohttp.ClientSession", _Boom):
+        assert await recognizer._try_audd(str(snip)) is None
+
+
+def test_song_card_shows_spotify_and_drops_bad_urls():
+    from bot.keyboards.inline import song_card_keyboard
+    kb = song_card_keyboard("https://music.apple.com/x", "http://insecure", False, "k", "en",
+                            spotify_url="https://open.spotify.com/track/1")
+    urls = [b.url for row in kb.inline_keyboard for b in row if b.url]
+    assert urls == ["https://music.apple.com/x", "https://open.spotify.com/track/1"]
+
+
+# ── Several links in one message ─────────────────────────────────────────────
+
+def test_extract_urls_dedupes_and_caps():
+    from bot.handlers.download import MAX_URLS_PER_MESSAGE, extract_urls
+    text = ("https://youtu.be/a https://youtu.be/a "
+            "https://www.youtube.com/watch?v=b&utm_source=x https://www.youtube.com/watch?v=b "
+            + " ".join(f"https://youtu.be/v{i}" for i in range(10)))
+    urls, truncated = extract_urls(text)
+    assert len(urls) == MAX_URLS_PER_MESSAGE and truncated
+    assert urls[0] == "https://youtu.be/a"
+    assert sum("v=b" in u for u in urls) == 1
+    assert extract_urls("https://youtu.be/a") == (["https://youtu.be/a"], False)
+
+
+@pytest.mark.asyncio
+async def test_multi_link_stops_at_user_cap_and_reports_once():
+    from bot.handlers import download
+    from bot.texts import t
+
+    message = MagicMock()
+    message.text = " ".join(f"https://youtu.be/v{i}" for i in range(4)) + " https://evil.com/x"
+    message.from_user = SimpleNamespace(id=77)
+    message.chat = SimpleNamespace(id=77)
+    message.bot.send_chat_action = AsyncMock()
+    message.answer = AsyncMock(return_value=SimpleNamespace(message_id=1))
+    slots = iter([True, True, False, False])
+    enqueue = AsyncMock()
+
+    with patch.object(download, "get_file_id", AsyncMock(return_value=None)), \
+         patch.object(download, "queue_has_room", AsyncMock(return_value=True)), \
+         patch.object(download, "reserve_slot", AsyncMock(side_effect=lambda uid: next(slots))), \
+         patch.object(download, "_enqueue_download", enqueue):
+        await download.handle_url(message, "en", MagicMock(), MagicMock())
+
+    assert enqueue.await_count == 2
+    texts = [c.args[0] for c in message.answer.await_args_list]
+    cap_msg = t("err.user_cap", "en", n=download.settings.per_user_download_cap)
+    assert texts.count(cap_msg) == 1, "cap error reported once, then processing stops"
+    assert t("err.unsupported", "en") not in texts, "links after the cap are not processed"
+
+
+@pytest.mark.asyncio
+async def test_multi_link_unsupported_reported_once_others_still_queued():
+    from bot.handlers import download
+    from bot.texts import t
+
+    message = MagicMock()
+    message.text = "https://evil.com/a https://youtu.be/ok https://other.bad/b"
+    message.from_user = SimpleNamespace(id=78)
+    message.chat = SimpleNamespace(id=78)
+    message.bot.send_chat_action = AsyncMock()
+    message.answer = AsyncMock(return_value=SimpleNamespace(message_id=1))
+    enqueue = AsyncMock()
+    with patch.object(download, "get_file_id", AsyncMock(return_value=None)), \
+         patch.object(download, "queue_has_room", AsyncMock(return_value=True)), \
+         patch.object(download, "reserve_slot", AsyncMock(return_value=True)), \
+         patch.object(download, "_enqueue_download", enqueue):
+        await download.handle_url(message, "uz", MagicMock(), MagicMock())
+    assert enqueue.await_count == 1
+    texts = [c.args[0] for c in message.answer.await_args_list]
+    assert texts.count(t("err.unsupported", "uz")) == 1
+
+
+# ── h264/aac preference ──────────────────────────────────────────────────────
+
+def test_video_opts_prefer_h264_aac_but_mp3_untouched():
+    from bot.services.downloader import _build_opts
+    assert _build_opts("/t/x.mp4", "720")["format_sort"] == ["res", "vcodec:h264", "acodec:aac"]
+    assert "format_sort" not in _build_opts("/t/x.mp3", "mp3")

@@ -16,6 +16,7 @@ T: dict[str, dict[str, str]] = {
     # ── Download progress ────────────────────────────────────────────────────
     "dl.downloading": {"uz": "⏳ Yuklanmoqda...", "ru": "⏳ Скачивается...", "en": "⏳ Downloading..."},
     "dl.queued":      {"uz": "📋 Navbatda...", "ru": "📋 В очереди...", "en": "📋 Queued..."},
+    "dl.too_many_links": {"uz": "ℹ️ Bitta xabardan faqat birinchi {n} ta havola yuklanadi.", "ru": "ℹ️ Из одного сообщения скачиваются только первые {n} ссылок.", "en": "ℹ️ Only the first {n} links of a message are downloaded."},
     "dl.uploading":   {"uz": "📤 Yuborilmoqda...", "ru": "📤 Отправляется...", "en": "📤 Uploading..."},
     "dl.done":        {"uz": "✅ Tayyor!", "ru": "✅ Готово!", "en": "✅ Done!"},
     "dl.recognizing": {"uz": "🎧 Musiqa aniqlanmoqda...", "ru": "🎧 Распознаётся музыка...", "en": "🎧 Recognizing music..."},

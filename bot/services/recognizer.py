@@ -8,7 +8,9 @@ from typing import Optional
 import shazamio
 from shazamio import Shazam
 
+from bot.config import settings
 from bot.logger import logger
+from bot.utils.text import safe_https_url
 from bot.services.media import extract_audio_snippet, get_temp_path, probe_duration, safe_delete
 
 _shazamio_version = getattr(shazamio, "__version__", "unknown")
@@ -17,8 +19,13 @@ _shazam = Shazam()
 logger.info(f"[shazam] Shazam() initialised — core_recognizer={type(_shazam.core_recognizer).__name__}")
 
 
+AUDD_ENDPOINT = "https://api.audd.io/"
+AUDD_TIMEOUT = 15
+
+
 class SongResult:
-    __slots__ = ("title", "artist", "coverart", "apple_url", "shazam_url", "lyrics")
+    __slots__ = ("title", "artist", "coverart", "apple_url", "shazam_url",
+                 "spotify_url", "lyrics", "source")
 
     def __init__(
         self,
@@ -28,6 +35,8 @@ class SongResult:
         apple_url: Optional[str] = None,
         shazam_url: Optional[str] = None,
         lyrics: Optional[str] = None,
+        spotify_url: Optional[str] = None,
+        source: str = "shazam",
     ):
         self.title = title
         self.artist = artist
@@ -35,6 +44,8 @@ class SongResult:
         self.apple_url = apple_url
         self.shazam_url = shazam_url
         self.lyrics = lyrics
+        self.spotify_url = spotify_url
+        self.source = source
 
 
 async def _try_recognize_snippet(media_path: str, snippet_path: str,
@@ -128,6 +139,16 @@ async def recognize(media_path: str) -> Optional[SongResult]:
             if result:
                 return result
 
+        # Shazam misses some tracks entirely (regional releases, remixes,
+        # covers). With an AudD.io key configured, retry once on the snippet
+        # already extracted for the last window — no extra ffmpeg call.
+        # No key → no request, no cost.
+        if settings.audd_token:
+            result = await _try_audd(snippet_path)
+            if result:
+                logger.info(f"[audd] FOUND: {result.title!r} — {result.artist!r}")
+                return result
+
         logger.info(f"Shazam: no match found for {media_path}")
         return None
 
@@ -136,6 +157,71 @@ async def recognize(media_path: str) -> Optional[SongResult]:
         return None
     finally:
         safe_delete(snippet_path)
+
+
+async def _try_audd(snippet_path: str) -> Optional[SongResult]:
+    """Recognize via AudD.io (fallback only). Never raises."""
+    try:
+        if not os.path.isfile(snippet_path) or os.path.getsize(snippet_path) < 1000:
+            return None
+        import aiohttp
+
+        with open(snippet_path, "rb") as fh:
+            audio = fh.read()
+        form = aiohttp.FormData()
+        form.add_field("api_token", settings.audd_token)
+        form.add_field("return", "apple_music,spotify")
+        form.add_field("file", audio, filename="snippet.wav", content_type="audio/wav")
+
+        t0 = time.monotonic()
+        timeout = aiohttp.ClientTimeout(total=AUDD_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(AUDD_ENDPOINT, data=form) as resp:
+                if resp.status != 200:
+                    logger.warning(f"[audd] HTTP {resp.status}")
+                    return None
+                payload = await resp.json(content_type=None)
+        logger.debug(f"[audd] {time.monotonic() - t0:.2f}s status={payload.get('status')}")
+    except Exception as exc:
+        # The token is in the form body, never in the URL — safe to log exc.
+        logger.warning(f"[audd] request failed: {type(exc).__name__}: {exc}")
+        return None
+
+    if not isinstance(payload, dict) or payload.get("status") != "success":
+        if isinstance(payload, dict) and payload.get("error"):
+            logger.warning(f"[audd] API error: {payload['error']}")
+        return None
+    result = payload.get("result")
+    return _parse_audd_result(result) if isinstance(result, dict) else None
+
+
+def _parse_audd_result(result: dict) -> Optional[SongResult]:
+    title = (result.get("title") or "").strip()
+    artist = (result.get("artist") or "").strip()
+    if not title:
+        return None
+    apple = result.get("apple_music") if isinstance(result.get("apple_music"), dict) else {}
+    spotify = result.get("spotify") if isinstance(result.get("spotify"), dict) else {}
+
+    coverart = None
+    artwork = apple.get("artwork") if isinstance(apple.get("artwork"), dict) else {}
+    if artwork.get("url"):
+        coverart = str(artwork["url"]).replace("{w}", "500").replace("{h}", "500")
+    else:
+        images = (spotify.get("album") or {}).get("images") or []
+        if images and isinstance(images[0], dict):
+            coverart = images[0].get("url")
+
+    return SongResult(
+        title=title,
+        artist=artist or "Unknown",
+        coverart=safe_https_url(coverart),
+        apple_url=safe_https_url(apple.get("url")),
+        shazam_url=None,
+        lyrics=None,
+        spotify_url=safe_https_url((spotify.get("external_urls") or {}).get("spotify")),
+        source="audd",
+    )
 
 
 def _parse_result(data: dict) -> Optional[SongResult]:

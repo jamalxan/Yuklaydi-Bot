@@ -7,7 +7,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.services.music_search import LONG_TRACK_SECONDS, SongEntry, format_duration
 from bot.texts import T, t
-from bot.utils.text import esc
+from bot.utils.text import esc, safe_https_url
 
 LANG_FLAGS = {"uz": "🇺🇿 O'zbek", "ru": "🇷🇺 Русский", "en": "🇬🇧 English"}
 
@@ -48,14 +48,17 @@ def song_card_keyboard(
     song_key: str,
     lang: str,
     show_download: bool = True,
+    spotify_url: Optional[str] = None,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
+    # Links come from Shazam/AudD: only valid https URLs become buttons —
+    # one bad URL would make Telegram reject the whole card.
     listen_btns = []
-    if apple_url:
-        listen_btns.append(InlineKeyboardButton(text="🍎 Apple Music", url=apple_url))
-    if shazam_url:
-        listen_btns.append(InlineKeyboardButton(text="🎧 Shazam", url=shazam_url))
+    for label, url in (("🍎 Apple Music", apple_url), ("🟢 Spotify", spotify_url), ("🎧 Shazam", shazam_url)):
+        url = safe_https_url(url)
+        if url:
+            listen_btns.append(InlineKeyboardButton(text=label, url=url))
     if listen_btns:
         builder.row(*listen_btns)
 

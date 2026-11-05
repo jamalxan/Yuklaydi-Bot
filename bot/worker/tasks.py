@@ -500,6 +500,7 @@ async def recognize_task(
                     "coverart": result.coverart,
                     "apple_url": result.apple_url,
                     "shazam_url": result.shazam_url,
+                    "spotify_url": result.spotify_url,
                     "lyrics": lyrics,
                 })
 
@@ -510,7 +511,8 @@ async def recognize_task(
                         if lyrics:
                             await SongCacheRepo(session).save(result.title, result.artist, lyrics)
                         await RecognitionRepo(session).log(user_id, result.title, result.artist,
-                                                           found_lyrics=bool(lyrics))
+                                                           found_lyrics=bool(lyrics),
+                                                           source=result.source)
                         await UserRepo(session).inc_recognitions(user_id)
                         await UserRepo(session).touch(user_id)
                 except Exception as e:
@@ -524,6 +526,7 @@ async def recognize_task(
                     has_lyrics=bool(lyrics),
                     song_key=song_key,
                     lang=lang,
+                    spotify_url=result.spotify_url,
                 )
                 # Shazam metadata is external text: escape before HTML.
                 caption = f"🎵 <b>{esc(result.title)}</b>\n👤 {esc(result.artist)}"

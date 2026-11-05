@@ -310,6 +310,9 @@ def build_base_opts(**overrides) -> dict:
     return opts
 
 
+VIDEO_FORMAT_SORT = ("res", "vcodec:h264", "acodec:aac")
+
+
 def _build_opts(output_path: str, quality: str) -> dict:
     opts = build_base_opts(
         outtmpl=output_path,
@@ -349,6 +352,10 @@ def _build_opts(output_path: str, quality: str) -> dict:
     else:
         # Abort mid-transfer if the server sends more than we could upload.
         opts["max_filesize"] = settings.max_file_bytes
+        # Among formats the selector already allows (height/size/protocol caps
+        # still win), prefer h264 + aac: they play inline in Telegram, on iOS
+        # and on older Android without a transcode; vp9/av1 often do not.
+        opts["format_sort"] = list(VIDEO_FORMAT_SORT)
         # No transcode for video — remux/mux only (skip for MP3 which needs re-encode)
         opts["postprocessor_args"] = {"default": ["-c", "copy"]}
 

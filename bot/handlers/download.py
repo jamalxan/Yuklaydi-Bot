@@ -38,9 +38,34 @@ _DL = {k.split(".", 1)[1]: v for k, v in T.items() if k.startswith("dl.")}
 _ERR = {k.split(".", 1)[1]: v for k, v in T.items() if k.startswith("err.")}
 
 
+MAX_URLS_PER_MESSAGE = 5
+
+
 def extract_url(text: str) -> Optional[str]:
     m = URL_RE.search(text or "")
     return m.group(0) if m else None
+
+
+def extract_urls(text: str, limit: int = MAX_URLS_PER_MESSAGE) -> tuple[list[str], bool]:
+    """Distinct links in order (deduped by normalized form), capped at *limit*.
+
+    Returns (urls, truncated). The same video pasted twice — or once with
+    tracking parameters — is downloaded once.
+    """
+    seen: set[str] = set()
+    urls: list[str] = []
+    truncated = False
+    for m in URL_RE.finditer(text or ""):
+        raw = m.group(0)
+        key = normalize_url(raw) if detect_platform(raw) else raw
+        if key in seen:
+            continue
+        if len(urls) >= limit:
+            truncated = True
+            break
+        seen.add(key)
+        urls.append(raw)
+    return urls, truncated
 
 
 async def queue_has_room(queue: str) -> bool:
@@ -89,20 +114,19 @@ async def _record_cache_hit(user_id: int, url: str, platform: str, kind: str,
         logger.warning(f"Cache-hit stat write failed: {e}")
 
 
-@router.message(lambda m: bool(extract_url(m.text or "")))
-async def handle_url(message: Message, user_lang: str, user_repo: UserRepo, download_repo: DownloadRepo):
-    url = extract_url(message.text)
-    if not url:
-        return
+# Outcomes of one link. Errors are reported once per message by handle_url;
+# STOP outcomes end processing of the remaining links (no point retrying them).
+_STOP = frozenset({"overloaded", "user_cap"})
 
-    lang = user_lang
+
+async def _process_one_url(message: Message, url: str, lang: str,
+                           user_repo: UserRepo, download_repo: DownloadRepo) -> str:
+    """Queue (or serve from cache) one link. Returns "ok" or an error kind."""
     platform = detect_platform(url)
-
     # Only known platforms (exact host match) are downloadable. Arbitrary URLs
     # would let anyone make the server fetch internal addresses (SSRF).
     if platform is None:
-        await message.answer(t("err.unsupported", lang))
-        return
+        return "unsupported"
 
     normalized = normalize_url(url)
 
@@ -111,8 +135,7 @@ async def handle_url(message: Message, user_lang: str, user_repo: UserRepo, down
     if platform == "instagram" and not has_cookies():
         logger.warning("Instagram request rejected: no cookies configured "
                        "(set COOKIES_FILE or COOKIES_FROM_BROWSER)")
-        await message.answer(t("err.ig_disabled", lang))
-        return
+        return "ig_disabled"
 
     # Cache hit → instant send, no worker needed
     cached_id = await get_file_id(normalized, "720")
@@ -126,15 +149,13 @@ async def handle_url(message: Message, user_lang: str, user_repo: UserRepo, down
         )
         await _record_cache_hit(message.from_user.id, normalized, platform, "video",
                                 user_repo, download_repo)
-        return
+        return "ok"
 
     if not await queue_has_room(DOWNLOAD_QUEUE):
-        await message.answer(t("err.overloaded", lang))
-        return
+        return "overloaded"
 
     if not await reserve_slot(message.from_user.id):
-        await message.answer(t("err.user_cap", lang, n=settings.per_user_download_cap))
-        return
+        return "user_cap"
 
     try:
         await message.bot.send_chat_action(message.chat.id, "upload_video")
@@ -151,7 +172,36 @@ async def handle_url(message: Message, user_lang: str, user_repo: UserRepo, down
     except Exception as e:
         logger.error(f"Failed to enqueue download: {e}")
         await release_user_slot(message.from_user.id)
-        await message.answer(t("err.generic", lang))
+        return "generic"
+    return "ok"
+
+
+@router.message(lambda m: bool(extract_url(m.text or "")))
+async def handle_url(message: Message, user_lang: str, user_repo: UserRepo, download_repo: DownloadRepo):
+    """Every link in the message (up to MAX_URLS_PER_MESSAGE) is downloaded.
+
+    Each link still takes its own per-user slot, so a pasted list cannot
+    bypass PER_USER_DOWNLOAD_CAP; once the cap or the queue limit is hit the
+    remaining links are skipped and the user is told once.
+    """
+    urls, truncated = extract_urls(message.text)
+    if not urls:
+        return
+    lang = user_lang
+
+    reported: set[str] = set()
+    for url in urls:
+        outcome = await _process_one_url(message, url, lang, user_repo, download_repo)
+        if outcome == "ok" or outcome in reported:
+            continue
+        reported.add(outcome)
+        n = settings.per_user_download_cap
+        await message.answer(t("err.user_cap", lang, n=n) if outcome == "user_cap" else t(f"err.{outcome}", lang))
+        if outcome in _STOP:
+            break
+
+    if truncated:
+        await message.answer(t("dl.too_many_links", lang, n=MAX_URLS_PER_MESSAGE))
 
 
 @router.callback_query(F.data.startswith("vdalt:"))
