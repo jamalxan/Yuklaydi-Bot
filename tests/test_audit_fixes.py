@@ -1192,3 +1192,33 @@ def test_nothing_fits_still_reports_too_large():
          pytest.raises(d.DownloadError) as ei:
         d.run_ydl("https://www.tiktok.com/@u/video/1", opts, "720")
     assert ei.value.kind == "too_large" and "dl" not in _FakeYDL.calls
+
+
+# ── 500 MB limit with the Local Bot API ──────────────────────────────────────
+
+def test_local_api_allows_500mb_and_cloud_is_clamped():
+    from bot.config import Settings
+    local = Settings(local_api_url="http://telegram-bot-api:8081", max_file_mb=500, job_timeout=900)
+    assert local.max_file_mb == 500 and local.max_file_bytes == 500 * 1024 * 1024
+    assert Settings(local_api_url="", max_file_mb=500).max_file_mb == 50
+    assert Settings(local_api_url="http://x:8081", max_file_mb=5000).max_file_mb == 2000
+
+
+def test_short_job_timeout_for_big_files_warns(caplog):
+    from bot.config import Settings, recommended_job_timeout
+    assert recommended_job_timeout(500) == 750 and recommended_job_timeout(50) == 300
+    with caplog.at_level(logging.WARNING, logger="yuklaydi.config"):
+        Settings(local_api_url="http://x:8081", max_file_mb=500, job_timeout=300)
+    assert any("JOB_TIMEOUT" in r.getMessage() for r in caplog.records)
+
+
+def test_compose_defaults_are_500mb_and_900s():
+    src = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "MAX_FILE_MB: ${MAX_FILE_MB:-500}" in src and "JOB_TIMEOUT: ${JOB_TIMEOUT:-900}" in src
+
+
+def test_too_large_message_shows_current_limit():
+    from bot.config import settings
+    from bot.texts import t
+    with patch.object(settings, "max_file_mb", 500):
+        assert "500" in t("err.too_large", "uz")

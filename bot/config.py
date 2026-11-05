@@ -10,7 +10,13 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 CLOUD_API_MAX_MB = 50
-CLOUD_API_GETFILE_MAX_MB = 20  # getFile download limit on the cloud API
+CLOUD_API_GETFILE_MAX_MB = 20
+LOCAL_API_MAX_MB = 2000  # Local Bot API server upload limit
+
+
+def recommended_job_timeout(max_file_mb: int) -> int:
+    """Seconds a worst-case job needs for a file of *max_file_mb*."""
+    return 300 + max(0, max_file_mb - 50)  # getFile download limit on the cloud API
 
 
 class Settings(BaseSettings):
@@ -100,6 +106,21 @@ class Settings(BaseSettings):
                 self.max_file_mb, CLOUD_API_MAX_MB,
             )
             self.max_file_mb = CLOUD_API_MAX_MB
+        if self.max_file_mb > LOCAL_API_MAX_MB:
+            logging.getLogger("yuklaydi.config").warning(
+                "MAX_FILE_MB=%s capped to the Local Bot API limit of %s MB",
+                self.max_file_mb, LOCAL_API_MAX_MB,
+            )
+            self.max_file_mb = LOCAL_API_MAX_MB
+        # Big files need time: download + ffmpeg merge + upload through the
+        # Local Bot API. Rough floor: 300 s plus 1 s per MB above 50 MB.
+        needed = recommended_job_timeout(self.max_file_mb)
+        if self.job_timeout < needed:
+            logging.getLogger("yuklaydi.config").warning(
+                "JOB_TIMEOUT=%ss is short for MAX_FILE_MB=%s; large files may "
+                "time out. Recommended: JOB_TIMEOUT>=%s", self.job_timeout,
+                self.max_file_mb, needed,
+            )
         return self
 
     @property

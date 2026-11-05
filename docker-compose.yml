@@ -29,6 +29,10 @@ x-app-env: &app-env
   REDIS_URL: redis://redis:6379/0
   REDIS_PASSWORD: ${REDIS_PASSWORD:-}
   DOWNLOAD_DIR: /downloads
+  # Files up to 500 MB are sent through the Local Bot API above (the cloud
+  # API stops at 50 MB). Big files need a longer job deadline.
+  MAX_FILE_MB: ${MAX_FILE_MB:-500}
+  JOB_TIMEOUT: ${JOB_TIMEOUT:-900}
 
 services:
   telegram-bot-api:

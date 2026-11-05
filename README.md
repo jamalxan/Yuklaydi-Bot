@@ -29,7 +29,7 @@ Copy `.env.example` to `.env` and fill in:
 | `REDIS_URL` | Redis connection URL | Set in docker-compose |
 | `LOCAL_API_URL` | Local Bot API server URL | `http://telegram-bot-api:8081` |
 | `DOWNLOAD_DIR` | Path for temporary downloads | `/downloads` |
-| `MAX_FILE_MB` | Max upload size in MB | `2000` |
+| `MAX_FILE_MB` | Max upload size in MB (>50 needs the Local Bot API; cloud API is clamped to 50) | `500` |
 | `WORKER_CONCURRENCY` | arq jobs per worker | `5` |
 
 ---
@@ -110,6 +110,18 @@ New change: `alembic revision -m "..."`, then write the migration by hand.
 `docker-compose.prod.yml` refuses to start unless `POSTGRES_PASSWORD` and
 `REDIS_PASSWORD` are set. The base file has no hard-coded passwords, and the
 Bot API port is bound to `127.0.0.1` only.
+
+## Large files (up to 500 MB)
+
+Telegram's cloud Bot API caps uploads at 50 MB. Larger files go through the
+`telegram-bot-api` container (`LOCAL_API_URL`, needs `TELEGRAM_API_ID` /
+`TELEGRAM_API_HASH` from my.telegram.org). Defaults: `MAX_FILE_MB=500`,
+`JOB_TIMEOUT=900`. If a video is bigger than the limit, the bot sends a lower
+resolution (480p → 360p → 240p) that fits.
+
+Disk: each in-flight download can take ~2× the file size (streams + merged
+file). Budget about `replicas × YT_DLP_WORKER_CONCURRENCY × 2 × MAX_FILE_MB`
+of free space on the `downloads` volume (3 × 4 × 2 × 500 MB ≈ 12 GB).
 
 ## Temp-file cleanup
 
