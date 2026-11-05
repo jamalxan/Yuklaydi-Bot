@@ -1126,3 +1126,69 @@ def test_remove_partials_accepts_ytdlp_rewritten_dict(tmp_path):
     _remove_partials({"default": str(tmp_path / "shz_a.%(ext)s"), "chapter": "x"})
     left = {p.name for p in tmp_path.iterdir()}
     assert left == {"shz_a.m4a", "shz_other.part"}
+
+
+# ── Oversized video falls back to a lower resolution (found in live bot run) ─
+
+@pytest.mark.parametrize("quality,height", [("720", 720), ("1080", 1080), ("480", 480), ("360p", 360), ("junk", 720)])
+def test_format_selector_honours_numeric_height(quality, height):
+    from bot.services.downloader import _format_selector
+    assert f"[height<={height}]" in _format_selector(quality, None).split("/")[0]
+
+
+def test_format_selector_prefers_modest_audio_bitrate():
+    from bot.services.downloader import _format_selector
+    assert "[abr<=?192]" in _format_selector("720", None).split("/")[0]
+
+
+def test_fallback_heights():
+    from bot.services.downloader import fallback_heights
+    assert fallback_heights("720") == [480, 360, 240]
+    assert fallback_heights("1080") == [720, 480, 360, 240]
+    assert fallback_heights("mp3") == []
+
+
+class _LadderYDL(_FakeYDL):
+    """Sizes by selected height: only ≤ 360p fits a 50 MB limit."""
+    SIZES = {720: 90, 480: 60, 360: 28, 240: 12}
+
+    def __init__(self, opts):
+        super().__init__(opts)
+        self.format_selector = opts["format"]
+
+    def build_format_selector(self, spec):
+        return spec
+
+    def _pick(self):
+        import re
+        h = int(re.search(r"height<=(\d+)", self.format_selector).group(1))
+        return {"duration": 600, "filesize": self.SIZES[h] * 1024 * 1024, "height": h}
+
+    def extract_info(self, url, download=False):
+        return {"duration": 600, "formats": [1], **self._pick()}
+
+    def process_ie_result(self, info, download=True):
+        _FakeYDL.calls.append(self._pick()["height"] if not download else "dl")
+        return {**info, **self._pick()}
+
+
+def test_too_large_video_is_delivered_at_lower_resolution():
+    from bot.config import settings
+    from bot.services import downloader as d
+    _FakeYDL.calls = []
+    opts = d.build_base_opts(outtmpl="/t/ydl_l.mp4", format=d._format_selector("720", None))
+    with patch.object(settings, "max_file_mb", 50), patch("yt_dlp.YoutubeDL", _LadderYDL):
+        info, _, _ = d.run_ydl("https://www.tiktok.com/@u/video/1", opts, "720")
+    assert info["height"] == 360
+    assert _FakeYDL.calls == [480, 360, "dl"]
+
+
+def test_nothing_fits_still_reports_too_large():
+    from bot.config import settings
+    from bot.services import downloader as d
+    _FakeYDL.calls = []
+    opts = d.build_base_opts(outtmpl="/t/ydl_m.mp4", format=d._format_selector("720", None))
+    with patch.object(settings, "max_file_mb", 5), patch("yt_dlp.YoutubeDL", _LadderYDL), \
+         pytest.raises(d.DownloadError) as ei:
+        d.run_ydl("https://www.tiktok.com/@u/video/1", opts, "720")
+    assert ei.value.kind == "too_large" and "dl" not in _FakeYDL.calls

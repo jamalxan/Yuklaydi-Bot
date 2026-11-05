@@ -208,13 +208,17 @@ def _format_selector(quality: str, max_bytes: Optional[int] = None) -> str:
             # the video half away).
             "/b[protocol!*=m3u8][height<=480]/ba/b/best"
         )
-    h = 1080 if quality in ("1080", "1080p") else 720
+    q = quality.lower().rstrip("p")
+    h = int(q) if q.isdigit() and 100 <= int(q) <= 2160 else 720
     f = _size_filter(max_bytes)
     return (
         # 1) Separate video+audio over plain https (DASH): the only way to get
         #    real 720p/1080p from YouTube — its combined mp4 tops out at 360p.
         #    Merged with "-c copy", no transcode; m4a audio first for mp4.
-        f"bv[protocol!*=m3u8][height<={h}]{f}+ba[protocol!*=m3u8][ext=m4a]"
+        #    Audio ≤ 192 kbps first: "best m4a" can be a 384 kbps 5.1 track
+        #    (≈ 30 MB on a 10-minute video) that alone blows the upload limit.
+        f"bv[protocol!*=m3u8][height<={h}]{f}+ba[protocol!*=m3u8][ext=m4a][abr<=?192]"
+        f"/bv[protocol!*=m3u8][height<={h}]{f}+ba[protocol!*=m3u8][ext=m4a]"
         f"/bv[protocol!*=m3u8][height<={h}]{f}+ba[protocol!*=m3u8]"
         # 2) Combined https file (TikTok, Instagram, Facebook, X usually).
         f"/b[protocol!*=m3u8][ext=mp4][height<={h}]{f}/b[protocol!*=m3u8][height<={h}]{f}"
@@ -508,6 +512,55 @@ def _remove_partials(outtmpl) -> None:
         pass
 
 
+# Lower resolutions tried (same metadata, no re-extract) when the requested
+# one would exceed the upload limit — a 92 MB 720p video should arrive as
+# 480p/360p, not as "file too large".
+_HEIGHT_LADDER = (720, 480, 360, 240)
+
+# Keys a previous format selection leaves on the info dict. They must go
+# before re-selecting, or estimate_size would read the old pick's sizes.
+_SELECTION_KEYS = (
+    "requested_formats", "requested_downloads", "format_id", "format", "ext",
+    "filesize", "filesize_approx", "tbr", "vbr", "abr", "width", "height",
+    "resolution", "fps", "vcodec", "acodec", "protocol", "url", "manifest_url",
+    "fragments", "dynamic_range", "format_note", "language",
+)
+
+
+def fallback_heights(quality: str) -> list[int]:
+    """Heights below the requested video quality, best first ([] for mp3)."""
+    if quality == "mp3":
+        return []
+    top = 1080 if quality in ("1080", "1080p") else 720
+    return [h for h in _HEIGHT_LADDER if h < top]
+
+
+def _reselect_smaller(ydl, info: dict, quality: str, max_bytes: int) -> dict:
+    """Re-run format selection on *info* for lower heights; first that fits wins.
+
+    Raises the original too_large DownloadError when nothing fits.
+    """
+    for h in fallback_heights(quality):
+        sel = _format_selector(str(h), max_bytes)
+        ydl.format_selector = ydl.build_format_selector(sel)
+        candidate = {k: v for k, v in info.items() if k not in _SELECTION_KEYS}
+        try:
+            candidate = ydl.process_ie_result(candidate, download=False)
+        except yt_dlp.utils.DownloadError:
+            continue  # no format at this height
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            check_limits(candidate, quality)
+        except DownloadError as e:
+            if e.kind == "too_large":
+                continue
+            raise
+        logger.info(f"Requested {quality}p too large; delivering {h}p instead")
+        return candidate
+    raise DownloadError("No format fits the upload limit", kind="too_large")
+
+
 def run_ydl(url: str, opts: dict, quality: Optional[str] = None) -> tuple[dict, float, float]:
     """Two-pass yt-dlp run shared by every download path.
 
@@ -531,7 +584,12 @@ def run_ydl(url: str, opts: dict, quality: Optional[str] = None) -> tuple[dict, 
                 if not isinstance(info, dict):
                     raise DownloadError("No media info", kind="generic")
                 if quality:
-                    check_limits(info, quality)
+                    try:
+                        check_limits(info, quality)
+                    except DownloadError as e:
+                        if e.kind != "too_large" or not fallback_heights(quality):
+                            raise
+                        info = _reselect_smaller(ydl, info, quality, settings.max_file_bytes)
                 t_extract = time.monotonic() - t0
                 t1 = time.monotonic()
                 processed = ydl.process_ie_result(info, download=True)
