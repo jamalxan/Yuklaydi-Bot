@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ipaddress
 import os
 import shutil
+import tempfile
 import time
 from typing import Optional
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlsplit, urlunparse
@@ -283,6 +285,10 @@ def classify_download_error(exc: BaseException) -> "DownloadError":
     msg = str(exc).lower()
     if "private" in msg or "removed" in msg or "deleted" in msg:
         return DownloadError(str(exc), kind="private")
+    elif "[instagram]" in msg and "http error 400" in msg:
+        # Instagram's media-info endpoint answers 400 for deleted/unavailable
+        # posts (verified with login cookies on two long-gone reels).
+        return DownloadError(str(exc), kind="private")
     elif "geo" in msg or "not available in your country" in msg:
         return DownloadError(str(exc), kind="geo")
     elif "larger than max-filesize" in msg:
@@ -399,6 +405,34 @@ def _apply_cookies(opts: dict) -> None:
     if settings.cookies_from_browser:
         # ("chrome",) tuple form = browser name without profile/keyring specs
         opts["cookiesfrombrowser"] = (settings.cookies_from_browser,)
+
+
+@contextlib.contextmanager
+def open_ydl(opts: dict):
+    """``yt_dlp.YoutubeDL(opts)`` that never writes back to the master cookie file.
+
+    YoutubeDL.close() saves the jar to ``cookiefile``. The master lives in
+    secrets/ (a read-only mount in Docker: every cookie-gated download failed
+    with "[Errno 30] Read-only file system") and natively several yt-dlp runs
+    would race on one file. Each run therefore gets a private throwaway copy;
+    *opts* is edited in place so the dict yt-dlp holds is the one callers see.
+    """
+    master = opts.get("cookiefile")
+    tmp = None
+    if master:
+        fd, tmp = tempfile.mkstemp(prefix="ytdlp_cookies_", suffix=".txt")
+        os.close(fd)
+        shutil.copyfile(master, tmp)
+        opts["cookiefile"] = tmp
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            yield ydl
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 _MEDIA_EXTS = (".mp4", ".mp3", ".m4a", ".webm", ".opus", ".ogg", ".mkv")
@@ -637,7 +671,7 @@ def run_ydl(url: str, opts: dict, quality: Optional[str] = None) -> tuple[dict, 
     for i, o in enumerate(attempts):
         t0 = time.monotonic()
         try:
-            with yt_dlp.YoutubeDL(o) as ydl:
+            with open_ydl(o) as ydl:
                 info = ydl.extract_info(url, download=False)
                 if not isinstance(info, dict):
                     raise DownloadError("No media info", kind="generic")

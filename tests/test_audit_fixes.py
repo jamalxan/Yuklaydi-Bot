@@ -1532,3 +1532,54 @@ def test_run_ydl_single_format_size_decides_downloader():
         d.run_ydl("https://www.tiktok.com/@u/video/1",
                   d.build_base_opts(outtmpl="/t/sz1.mp4", external_downloader="aria2c"), "720")
     assert _SizedYDL.seen == [None]
+
+
+# ── cookies: yt-dlp must never write back to the master file ─────────────────
+# YoutubeDL.close() saves the jar to ``cookiefile``. In Docker secrets/ is a
+# read-only mount, so every Instagram download died with "[Errno 30]
+# Read-only file system: '/app/secrets/cookies.txt'"; natively, parallel
+# runs would race on one file. Each run gets a private throwaway copy.
+
+def test_run_ydl_hands_yt_dlp_a_private_cookie_copy(tmp_path):
+    import os
+    from bot.services import downloader as d
+    master = tmp_path / "cookies.txt"
+    master.write_text("# Netscape HTTP Cookie File\n.instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tx\n")
+    before = master.read_text()
+
+    class _Rec(_FakeYDL):
+        seen: list = []
+
+        def process_ie_result(self, info, download=True):
+            p = self.opts["cookiefile"]
+            _Rec.seen.append((p, os.path.isfile(p)))
+            with open(p, "a") as fh:  # what yt-dlp does on close()
+                fh.write("# saved\n")
+            return info
+
+    opts = d.build_base_opts(outtmpl=str(tmp_path / "v.mp4"), cookiefile=str(master))
+    with patch("yt_dlp.YoutubeDL", _Rec):
+        d.run_ydl("https://www.instagram.com/reel/abc/", opts, "720")
+    (path, existed), = _Rec.seen
+    assert existed and path != str(master), "yt-dlp must get a copy, not the master"
+    assert not os.path.exists(path), "the copy is removed after the run"
+    assert master.read_text() == before, "master cookie file must stay untouched"
+
+
+def test_open_ydl_without_cookies_passes_opts_through():
+    from bot.services import downloader as d
+    with patch("yt_dlp.YoutubeDL", _FakeYDL):
+        with d.open_ydl({"quiet": True}) as ydl:
+            assert ydl.opts == {"quiet": True}
+
+
+def test_instagram_http_400_means_post_is_gone():
+    """Instagram's media-info endpoint answers 400 for deleted/unavailable
+    posts (seen on two reels from 2018/2024); generic text would be misleading."""
+    import yt_dlp
+    from bot.services.downloader import classify_download_error
+    err = yt_dlp.utils.DownloadError(
+        "ERROR: [Instagram] BkfuX9UB-eK: Video info extraction failed: HTTP Error 400: Bad Request")
+    assert classify_download_error(err).kind == "private"
+    other = yt_dlp.utils.DownloadError("ERROR: [youtube] x: HTTP Error 400: Bad Request")
+    assert classify_download_error(other).kind == "generic"

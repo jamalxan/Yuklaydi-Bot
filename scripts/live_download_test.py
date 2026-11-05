@@ -19,7 +19,7 @@ TEST_URLS = {
     "youtube":     ("https://www.youtube.com/watch?v=jNQXAC9IVRw", "720"),   # "Me at the zoo", 19s
     "youtube_mp3": ("https://www.youtube.com/watch?v=jNQXAC9IVRw", "mp3"),
     "tiktok":      ("https://www.tiktok.com/@tiktok/video/7231338487075638570", "720"),
-    "instagram":   ("https://www.instagram.com/reel/C3QHiJDRhLh/", "720"),
+    "instagram":   ("https://www.instagram.com/reel/Chunk8-jurw/", "720"),  # @instagram, 5 s
 }
 
 
