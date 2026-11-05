@@ -104,10 +104,12 @@ def test_render_preserves_html_and_escapes_user_input():
 # ── Lang code validation ──────────────────────────────────────────────────────
 
 def test_lang_codes_are_valid():
-    """The only supported lang codes must be uz, ru, en."""
-    valid = {"uz", "ru", "en"}
+    """Supported lang codes: uz, oz (Uzbek Cyrillic), ru, en."""
+    valid = {"uz", "oz", "ru", "en"}
     from bot.handlers.start import HELP_TEXTS
+    from bot.db.repo import SUPPORTED_LANGS
     assert set(HELP_TEXTS.keys()) == valid
+    assert set(SUPPORTED_LANGS) == valid
 
 
 def test_default_lang_is_supported():

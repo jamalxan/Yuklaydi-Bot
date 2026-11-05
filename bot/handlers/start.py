@@ -10,7 +10,7 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
 from bot.db.repo import SUPPORTED_LANGS, UserRepo, WelcomeRepo
-from bot.keyboards.inline import lang_keyboard
+from bot.keyboards.inline import lang_keyboard, welcome_keyboard
 from bot.services.cache import set_user_lang
 from bot.texts import DEFAULT_WELCOME, T, t
 
@@ -18,6 +18,11 @@ logger = logging.getLogger("yuklaydi.start")
 
 router = Router()
 router.message.filter(F.chat.type == ChatType.PRIVATE)
+
+# /start in a group (sent by Telegram when the bot is added through the
+# "add to group" link): a one-line hint, no language picker.
+group_router = Router()
+group_router.message.filter(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 
 HELP_TEXTS = T["help"]
 _DEFAULT_WELCOME = DEFAULT_WELCOME
@@ -50,12 +55,13 @@ async def send_welcome(message: Message, lang: str, first_name: str, username: s
     every single user.
     """
     template = await _get_welcome(lang)
+    kb = welcome_keyboard(lang)
     try:
-        await message.answer(_render(template, first_name, username), parse_mode="HTML")
+        await message.answer(_render(template, first_name, username), parse_mode="HTML", reply_markup=kb)
     except TelegramBadRequest as e:
         logger.error(f"Custom welcome for '{lang}' is invalid, using default: {e}")
         default = _DEFAULT_WELCOME.get(lang, _DEFAULT_WELCOME["en"])
-        await message.answer(_render(default, first_name, username), parse_mode="HTML")
+        await message.answer(_render(default, first_name, username), parse_mode="HTML", reply_markup=kb)
 
 
 @router.message(Command("start"))
@@ -91,6 +97,11 @@ async def cb_lang_select(callback: CallbackQuery, user_repo: UserRepo):
         await send_welcome(callback.message, lang,
                            callback.from_user.first_name or "", callback.from_user.username or "")
     await callback.answer()
+
+
+@group_router.message(Command("start"))
+async def cmd_start_group(message: Message, user_lang: str):
+    await message.answer(t("group.hello", user_lang))
 
 
 @router.message(Command("lang"))

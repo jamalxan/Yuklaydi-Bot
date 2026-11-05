@@ -35,7 +35,7 @@ router.message.filter(F.chat.type == ChatType.PRIVATE)
 _BROADCAST_RATE = RATE_PER_SECOND  # messages per second (kept for imports/tests)
 _CTA_TEXT_MAX = 64
 _PANEL = "🛠 <b>Admin Panel</b>"
-_LANG_NAMES = {"uz": "O'zbek", "ru": "Русский", "en": "English"}
+_LANG_NAMES = {"uz": "O'zbek", "oz": "Ўзбекча", "ru": "Русский", "en": "English"}
 
 
 def _is_admin(user_id: int) -> bool:
@@ -312,7 +312,7 @@ async def cb_adm_welcome(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.callback_query(F.data.in_({"adm:wl_uz", "adm:wl_ru", "adm:wl_en"}))
+@router.callback_query(F.data.in_({"adm:wl_uz", "adm:wl_oz", "adm:wl_ru", "adm:wl_en"}))
 async def fsm_welcome_lang(callback: CallbackQuery, state: FSMContext):
     lang = callback.data.rsplit("_", 1)[-1]
     await state.update_data(welcome_lang=lang)

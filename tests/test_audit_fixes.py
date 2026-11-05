@@ -692,8 +692,11 @@ async def test_music_search_uses_cache():
         await music.handle_music_search(message, "uz")
 
     search.assert_not_called()
-    progress.edit_text.assert_awaited_once()
-    assert "Song" in progress.edit_text.await_args.args[0]
+    # One message, no "searching..." placeholder: the list is the first answer.
+    message.answer.assert_awaited_once()
+    progress.edit_text.assert_not_awaited()
+    text = message.answer.await_args.args[0]
+    assert "Song" in text and "Some Song" in text  # header = the user's query
 
 
 @pytest.mark.parametrize("raw,expected_none", [("a", True), ("!!", True), ("  ", True), ("ok song", False)])

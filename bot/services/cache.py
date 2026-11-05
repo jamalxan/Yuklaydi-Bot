@@ -15,8 +15,11 @@ FILE_ID_TTL = 60 * 60 * 24 * 30   # 30 days
 SONG_TTL = 60 * 60 * 24 * 7        # 7 days
 USER_LANG_TTL = 60 * 60 * 24       # 1 day
 MUSIC_SEARCH_TTL = 60 * 15         # 15 min
-VIDEO_SHAZAM_TTL = 60 * 60         # 1 hour
-URL_KEY_TTL = 60 * 60 * 24         # 24 hours
+# Buttons under a delivered video (quality / audio / find song) keep working
+# this long; they used to die after 1 h ("Video topilmadi").
+VIDEO_SHAZAM_TTL = 60 * 60 * 24 * 3  # 3 days
+URL_KEY_TTL = 60 * 60 * 24 * 3       # 3 days
+VIDEO_META_TTL = FILE_ID_TTL         # title/qualities live as long as the file_ids
 SETTING_TTL = 60 * 5               # 5 min
 
 
@@ -51,6 +54,37 @@ async def get_file_id(url: str, quality: str) -> Optional[str]:
 
 async def set_file_id(url: str, quality: str, file_id: str) -> None:
     await (await get_redis()).setex(_fid_key(url, quality), FILE_ID_TTL, file_id)
+
+
+async def cached_qualities(url: str, qualities) -> set[str]:
+    """Which of *qualities* already have a file_id for *url* (one round-trip)."""
+    qs = [str(q) for q in qualities]
+    if not qs:
+        return set()
+    values = await (await get_redis()).mget([_fid_key(url, q) for q in qs])
+    return {q for q, v in zip(qs, values) if v}
+
+
+# -- Video metadata (caption + quality buttons for cache hits) ----------------
+
+def url_key_for(url: str) -> str:
+    """Stable 12-hex key of a canonical URL (fits any callback_data)."""
+    return hashlib.sha256(url.encode()).hexdigest()[:12]
+
+
+async def set_video_meta(url: str, meta: dict) -> None:
+    keep = {k: meta.get(k) for k in ("title", "uploader", "duration", "width", "height",
+                                     "qualities", "thumbnail") if meta.get(k)}
+    await (await get_redis()).setex(f"vmeta:{url_key_for(url)}", VIDEO_META_TTL,
+                                    json.dumps(keep, ensure_ascii=False))
+
+
+async def get_video_meta(url: str) -> dict:
+    v = await (await get_redis()).get(f"vmeta:{url_key_for(url)}")
+    try:
+        return json.loads(v) if v else {}
+    except ValueError:
+        return {}
 
 
 # ── Song / lyrics cache ───────────────────────────────────────────────────────
@@ -126,8 +160,10 @@ async def get_music_search_by_hash(qhash: str) -> Optional[list]:
 # ── Video-for-Shazam short key ────────────────────────────────────────────────
 
 async def store_video_for_shazam(file_id: str, file_suffix: str = ".mp4",
-                                 source_url: str = "") -> str:
-    key = secrets.token_hex(5)  # 10 hex chars, unguessable, fits callback_data
+                                 source_url: str = "", key: Optional[str] = None) -> str:
+    # Callers that build the keyboard BEFORE the upload pass the URL key, so
+    # the buttons ride on the video itself instead of a second edit call.
+    key = key or secrets.token_hex(5)  # 10 hex chars, fits callback_data
     r = await get_redis()
     payload: dict = {"fid": file_id, "suf": file_suffix}
     if source_url:
@@ -144,7 +180,7 @@ async def get_video_for_shazam(key: str) -> Optional[dict]:
 # ── URL short key (for re-download buttons) ───────────────────────────────────
 
 async def store_url_key(url: str) -> str:
-    key = hashlib.sha256(url.encode()).hexdigest()[:12]
+    key = url_key_for(url)
     r = await get_redis()
     await r.setex(f"vdurl:{key}", URL_KEY_TTL, url)
     return key

@@ -86,6 +86,8 @@ async def on_startup(bot: Bot):
     try:
         await bot.set_my_commands(_commands(settings.default_lang), scope=BotCommandScopeDefault())
         for lang in LANGS:
+            if lang == "oz":
+                continue  # not an ISO 639-1 code: Telegram rejects it (Cyrillic users send "uz")
             await bot.set_my_commands(_commands(lang), scope=BotCommandScopeDefault(), language_code=lang)
         logger.info("Bot commands registered")
     except Exception as e:
@@ -96,6 +98,8 @@ async def on_shutdown(bot: Bot):
     logger.info("Shutting down...")
     from bot.services.queue import close_arq_pool
     await close_arq_pool()
+    from bot.services import yt_search
+    await yt_search.close()
     await bot.session.close()
     await engine.dispose()
 
@@ -122,6 +126,7 @@ async def main():
     # Routers — order determines handler priority
     dp.include_router(errors.router)
     dp.include_router(start.router)       # Commands: /start /lang /help
+    dp.include_router(start.group_router)  # /start in a group: one-line hint
     dp.include_router(admin.router)       # Admin-only: /admin /statistics + FSM
     dp.include_router(admin.user_router)  # channel:check (any user)
     dp.include_router(download.router)    # URL messages + vdalt/vshz callbacks

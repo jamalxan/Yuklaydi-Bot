@@ -23,7 +23,7 @@ def test_detect_platform(url, expected_platform):
 @pytest.mark.parametrize("raw,expected_clean", [
     (
         "https://youtu.be/dQw4w9WgXcQ?si=abc123",
-        "https://youtu.be/dQw4w9WgXcQ",
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
     ),
     (
         "https://www.youtube.com/watch?v=abc&utm_source=share&utm_medium=web",

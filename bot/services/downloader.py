@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import ipaddress
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -113,13 +114,85 @@ class DownloadError(Exception):
 
 
 class DownloadResult:
-    __slots__ = ("path", "t_extract", "t_download", "size_bytes")
+    __slots__ = ("path", "t_extract", "t_download", "size_bytes", "meta")
 
-    def __init__(self, path: str, t_extract: float, t_download: float, size_bytes: int):
+    def __init__(self, path: str, t_extract: float, t_download: float, size_bytes: int,
+                 meta: Optional[dict] = None):
         self.path = path
         self.t_extract = t_extract
         self.t_download = t_download
         self.size_bytes = size_bytes
+        # title / uploader / duration / width / height / thumbnail / qualities
+        # (see media_meta) - used for captions, quality buttons and MP3 tags.
+        self.meta = meta or {}
+
+
+# -- Quality ladder (labels shown on the quality buttons) ---------------------
+#
+# A quality is named after the SHORT side of the frame, the way YouTube labels
+# it: a vertical 720x1280 Short is "720p", not "1280p".
+QUALITY_LADDER = (360, 480, 720, 1080)
+
+
+def quality_bucket(short_side: int) -> Optional[int]:
+    """Ladder step a frame belongs to (240p -> 360, 1080p -> 1080, 4K -> None)."""
+    if not short_side or short_side <= 0:
+        return None
+    for q in QUALITY_LADDER:
+        if short_side <= q * 1.05:
+            return q
+    return None
+
+
+def _is_video_format(f: dict) -> bool:
+    return (f.get("vcodec") not in (None, "none") and f.get("ext") != "mhtml"
+            and bool(f.get("width")) and bool(f.get("height")))
+
+
+def available_qualities(info: dict) -> list[int]:
+    """Ladder steps this video can be delivered in, lowest first.
+
+    Steps that exist only as HLS are left out: YouTube throttles its m3u8
+    segments, so such a button would end in a timeout instead of a video.
+    """
+    found = set()
+    for f in info.get("formats") or []:
+        if _is_video_format(f) and "m3u8" not in (f.get("protocol") or ""):
+            q = quality_bucket(min(int(f["width"]), int(f["height"])))
+            if q:
+                found.add(q)
+    return sorted(found)
+
+
+def _frame_size(info: dict) -> tuple[int, int]:
+    """(width, height) of the selected video stream, (0, 0) if unknown."""
+    for f in info.get("requested_formats") or [info]:
+        if f.get("vcodec") not in (None, "none") and f.get("width") and f.get("height"):
+            return int(f["width"]), int(f["height"])
+    w, h = info.get("width"), info.get("height")
+    return (int(w), int(h)) if w and h else (0, 0)
+
+
+def is_portrait(info: dict) -> bool:
+    w, h = _frame_size(info)
+    return bool(w and h and h > w * 1.05)
+
+
+def media_meta(info: Optional[dict]) -> dict:
+    """The parts of a yt-dlp info dict the bot shows to users."""
+    info = info or {}
+    w, h = _frame_size(info)
+    uploader = info.get("uploader") or info.get("channel") or info.get("creator") or ""
+    return {
+        "title": " ".join(str(info.get("title") or "").split())[:200],
+        "uploader": " ".join(str(uploader).split())[:100],
+        "duration": int(float(info.get("duration") or 0)),
+        "width": w,
+        "height": h,
+        "quality": quality_bucket(min(w, h)) if w and h else None,
+        "qualities": available_qualities(info),
+        "thumbnail": info.get("thumbnail") or "",
+    }
 
 
 def detect_platform(url: str) -> Optional[str]:
@@ -160,10 +233,49 @@ async def resolve_shortlink(url: str, max_hops: int = 5, timeout: float = 10.0) 
     raise DownloadError("Too many redirects", kind="unsupported")
 
 
-def normalize_url(url: str) -> str:
-    """Strip tracking params and fragment so URL variants share one cache key."""
+_YT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_YT_PATH_ID_RE = re.compile(r"^/(?:shorts|live|embed|v|e)/([^/?#]+)")
+_IG_POST_RE = re.compile(r"^/(?:[A-Za-z0-9_.]+/)?(?:p|reels?|tv)/([A-Za-z0-9_-]+)")
+
+
+def youtube_video_id(url: str) -> Optional[str]:
+    """The 11-char id of any YouTube video URL form, or None."""
     try:
         parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return None
+    if host == "youtu.be":
+        cand = parsed.path.lstrip("/").split("/")[0]
+    elif _host_matches(host, "youtube.com") or _host_matches(host, "youtube-nocookie.com"):
+        if parsed.path.rstrip("/") == "/watch":
+            cand = (parse_qs(parsed.query).get("v") or [""])[0]
+        else:
+            m = _YT_PATH_ID_RE.match(parsed.path)
+            cand = m.group(1) if m else ""
+    else:
+        return None
+    return cand if _YT_ID_RE.match(cand or "") else None
+
+
+def normalize_url(url: str) -> str:
+    """One canonical form per video, so every variant shares one cache key.
+
+    YouTube (watch / youtu.be / shorts / live / embed / m. / music.) becomes
+    https://www.youtube.com/watch?v=<id>; Instagram posts, reels and IGTV
+    become https://www.instagram.com/p/<shortcode>/. Anything else only loses
+    its tracking parameters and fragment.
+    """
+    vid = youtube_video_id(url)
+    if vid:
+        return f"https://www.youtube.com/watch?v={vid}"
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if _host_matches(host, "instagram.com"):
+            m = _IG_POST_RE.match(parsed.path)
+            if m:
+                return f"https://www.instagram.com/p/{m.group(1)}/"
         params = parse_qs(parsed.query, keep_blank_values=True)
         cleaned = {k: v for k, v in params.items() if k not in _STRIP_PARAMS}
         new_query = urlencode(cleaned, doseq=True)
@@ -185,11 +297,20 @@ def _size_filter(max_bytes: Optional[int]) -> str:
     return f"[filesize<?{max_bytes}][filesize_approx<?{max_bytes}]"
 
 
-def _format_selector(quality: str, max_bytes: Optional[int] = None, audio_abr: int = 192) -> str:
+def quality_height(quality: str) -> int:
+    """Numeric target of a quality string ("360", "720p"...); 720 if unknown."""
+    q = (quality or "").lower().rstrip("p")
+    return int(q) if q.isdigit() and 100 <= int(q) <= 2160 else 720
+
+
+def _format_selector(quality: str, max_bytes: Optional[int] = None, audio_abr: int = 192,
+                     dim: str = "height") -> str:
     """
-    Priority: non-HLS progressive mp4 (no ffmpeg merge) → non-HLS adaptive merge
-    → HLS at the same target (last resort, only when no direct-https stream
-    exists) → bare best.
+    Priority: non-HLS adaptive merge → non-HLS progressive file → HLS at the
+    same target (last resort, only when no direct-https stream exists) → bare
+    best. At 360p and below the progressive mp4 goes first: YouTube's format
+    18 is one H.264+AAC file, so there is a single download and no ffmpeg
+    merge (measured as fast or faster than 134+140 on every warm run).
 
     YouTube's "SABR-only streaming" rollout (mid-2026) has removed direct-https
     adaptive formats for most clients on many videos, leaving only HLS
@@ -210,23 +331,26 @@ def _format_selector(quality: str, max_bytes: Optional[int] = None, audio_abr: i
             # the video half away).
             "/b[protocol!*=m3u8][height<=480]/ba/b/best"
         )
-    q = quality.lower().rstrip("p")
-    h = int(q) if q.isdigit() and 100 <= int(q) <= 2160 else 720
+    h = quality_height(quality)
     f = _size_filter(max_bytes)
+    # *dim* is the side the quality caps: "height" for landscape, "width" for
+    # vertical video (its short side), so 720 means 720x1280 on a Short.
+    single = f"b[protocol!*=m3u8][ext=mp4][{dim}<={h}]{f}/" if h <= 360 else ""
     return (
+        single +
         # 1) Separate video+audio over plain https (DASH): the only way to get
         #    real 720p/1080p from YouTube — its combined mp4 tops out at 360p.
         #    Merged with "-c copy", no transcode; m4a audio first for mp4.
         #    Audio ≤ audio_abr kbps first: "best m4a" can be a 384 kbps 5.1
         #    track (≈ 30 MB on a 10-minute video) that alone blows the limit.
-        f"bv[protocol!*=m3u8][height<={h}]{f}+ba[protocol!*=m3u8][ext=m4a][abr<=?{audio_abr}]"
-        f"/bv[protocol!*=m3u8][height<={h}]{f}+ba[protocol!*=m3u8][abr<=?{audio_abr}]"
-        f"/bv[protocol!*=m3u8][height<={h}]{f}+ba[protocol!*=m3u8][ext=m4a]"
-        f"/bv[protocol!*=m3u8][height<={h}]{f}+ba[protocol!*=m3u8]"
+        f"bv[protocol!*=m3u8][{dim}<={h}]{f}+ba[protocol!*=m3u8][ext=m4a][abr<=?{audio_abr}]"
+        f"/bv[protocol!*=m3u8][{dim}<={h}]{f}+ba[protocol!*=m3u8][abr<=?{audio_abr}]"
+        f"/bv[protocol!*=m3u8][{dim}<={h}]{f}+ba[protocol!*=m3u8][ext=m4a]"
+        f"/bv[protocol!*=m3u8][{dim}<={h}]{f}+ba[protocol!*=m3u8]"
         # 2) Combined https file (TikTok, Instagram, Facebook, X usually).
-        f"/b[protocol!*=m3u8][ext=mp4][height<={h}]{f}/b[protocol!*=m3u8][height<={h}]{f}"
+        f"/b[protocol!*=m3u8][ext=mp4][{dim}<={h}]{f}/b[protocol!*=m3u8][{dim}<={h}]{f}"
         # 3) HLS only as a last resort (throttled hosts), then anything.
-        f"/bv[height<={h}]{f}+ba/b[height<={h}]{f}/b{f}/best"
+        f"/bv[{dim}<={h}]{f}+ba/b[{dim}<={h}]{f}/b{f}/best"
     )
 
 
@@ -603,22 +727,33 @@ def fallback_heights(quality: str) -> list[int]:
     """Heights below the requested video quality, best first ([] for mp3)."""
     if quality == "mp3":
         return []
-    top = 1080 if quality in ("1080", "1080p") else 720
+    top = quality_height(quality)
     return [h for h in _HEIGHT_LADDER if h < top]
 
 
-def _reselect_smaller(ydl, info: dict, quality: str, max_bytes: int) -> dict:
+def _apply_selector(ydl, info: dict, selector: str) -> Optional[dict]:
+    """Re-run format selection on already-extracted *info* (no network)."""
+    ydl.format_selector = ydl.build_format_selector(selector)
+    candidate = {k: v for k, v in info.items() if k not in _SELECTION_KEYS}
+    try:
+        candidate = ydl.process_ie_result(candidate, download=False)
+    except yt_dlp.utils.DownloadError:
+        return None
+    return candidate if isinstance(candidate, dict) else None
+
+
+def _reselect_smaller(ydl, info: dict, quality: str, max_bytes: int, dim: str = "height") -> dict:
     """Re-run format selection on *info* for lower heights; first that fits wins.
 
     Raises the original too_large DownloadError when nothing fits.
     """
-    top = 1080 if quality in ("1080", "1080p") else 720
+    top = quality_height(quality)
     # The requested height itself with lighter audio comes first.
     for h in [top] + fallback_heights(quality):
         for abr in _AUDIO_TIERS:
             if h == top and abr == _AUDIO_TIERS[0]:
                 continue  # that is the selection that was just rejected
-            sel = _format_selector(str(h), max_bytes, audio_abr=abr)
+            sel = _format_selector(str(h), max_bytes, audio_abr=abr, dim=dim)
             ydl.format_selector = ydl.build_format_selector(sel)
             candidate = {k: v for k, v in info.items() if k not in _SELECTION_KEYS}
             try:
@@ -695,13 +830,21 @@ def run_ydl(url: str, opts: dict, quality: Optional[str] = None) -> tuple[dict, 
                 info = ydl.extract_info(url, download=False)
                 if not isinstance(info, dict):
                     raise DownloadError("No media info", kind="generic")
+                dim = "height"
+                if quality and quality != "mp3" and is_portrait(info):
+                    # The first pass capped the long side; cap the short one.
+                    dim = "width"
+                    vertical = _apply_selector(
+                        ydl, info, _format_selector(quality, settings.max_video_bytes, dim=dim))
+                    if vertical is not None:
+                        info = vertical
                 if quality:
                     try:
                         check_limits(info, quality)
                     except DownloadError as e:
                         if e.kind != "too_large" or not fallback_heights(quality):
                             raise
-                        info = _reselect_smaller(ydl, info, quality, settings.max_video_bytes)
+                        info = _reselect_smaller(ydl, info, quality, settings.max_video_bytes, dim=dim)
                 t_extract = time.monotonic() - t0
                 _pick_downloader(o, info)
                 t1 = time.monotonic()
@@ -726,7 +869,7 @@ def _download_sync(url: str, output_path: str, quality: str) -> DownloadResult:
     limit = settings.max_file_bytes if quality == "mp3" else settings.max_video_bytes
     if size > limit:
         raise DownloadError("Too large", kind="too_large")
-    return DownloadResult(out, t_extract, t_download, size)
+    return DownloadResult(out, t_extract, t_download, size, media_meta(info))
 
 
 async def download(url: str, output_path: str, quality: str = "720") -> DownloadResult:

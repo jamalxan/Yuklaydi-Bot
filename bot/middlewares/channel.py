@@ -73,6 +73,14 @@ class ChannelCheckMiddleware(BaseMiddleware):
         if from_user is not None and from_user.id in settings.admin_ids:
             return await handler(event, data)
 
+        # Groups are never walled: a join prompt would land in the group chat
+        # for every member, and the group owner chose to add the bot.
+        chat = getattr(event, "chat", None)
+        if chat is None:
+            chat = getattr(getattr(event, "message", None), "chat", None)
+        if getattr(chat, "type", "private") in ("group", "supergroup"):
+            return await handler(event, data)
+
         is_callback = isinstance(event, CallbackQuery)
         if is_callback:
             if (event.data or "").startswith(_SKIP_CALLBACK_PREFIXES):

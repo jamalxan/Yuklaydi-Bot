@@ -97,6 +97,18 @@ class Settings(BaseSettings):
     job_timeout: int = 300               # arq job hard timeout (seconds)
     max_queue_depth: int = 100_000       # reject new jobs above this depth (backpressure)
 
+    # Delivery / speed
+    # Public @username of the bot, shown in captions and the "add to group" link.
+    bot_username: str = "vidyuklaydi_bot"
+    # YouTube is delivered at this quality first (360p is one progressive
+    # https stream: no merge, never throttled HLS, ~3x smaller than 720p); the
+    # other qualities are offered as buttons and fetched on demand.
+    youtube_default_quality: str = "360"
+    # Every other platform (Instagram, TikTok…): best stream up to this.
+    default_video_quality: str = "720"
+    # arq polls Redis for new jobs this often (seconds); its default is 0.5.
+    queue_poll_delay: float = 0.1
+
     # Logging
     log_level: str = "INFO"
 

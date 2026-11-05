@@ -19,7 +19,7 @@ from bot.db.models import (
 
 logger = logging.getLogger("yuklaydi.repo")
 
-SUPPORTED_LANGS = ("uz", "ru", "en")
+SUPPORTED_LANGS = ("uz", "oz", "ru", "en")  # oz = Uzbek Cyrillic
 
 
 # ── Time helpers: ONE definition of "today" for every statistic ──────────────

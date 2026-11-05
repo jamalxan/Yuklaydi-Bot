@@ -21,7 +21,7 @@ from bot.logger import logger, setup_logging
 from bot.services.cache import (
     acquire_single_flight, acquire_user_slot,
     get_file_id, release_single_flight, release_user_slot,
-    set_file_id, single_flight_held, store_song_meta, store_url_key, store_video_for_shazam,
+    set_file_id, single_flight_held, store_song_meta,
 )
 from bot.services.downloader import DownloadError, DownloadResult, download
 from bot.services.media import ffmpeg_path, get_temp_path, safe_delete
@@ -31,7 +31,7 @@ from bot.services.splitter import SplitError, remove_parts, split_video
 from bot.texts import T, error_text, t
 from bot.utils.text import esc
 
-CAPTION = "🤖 @vidyuklaydi_bot"
+CAPTION = f"👉 @{settings.bot_username}"
 
 # Backwards-compatible views of the localized strings (tests import these).
 _DL = {k.split(".", 1)[1]: v for k, v in T.items() if k.startswith("dl.")}
@@ -149,22 +149,24 @@ def _log_timing(event: str, **fields) -> None:
 
 
 @asynccontextmanager
-async def _user_job(bot: Bot, chat_id: int, message_id: int, lang: str):
+async def _user_job(bot: Bot, chat_id: int, message_id: int, lang: str, on_fail=None):
     """Common envelope for user-facing jobs.
 
     - asyncio.timeout fires a little BEFORE arq's job_timeout, so the user gets
       an honest "took too long" instead of an eternal "⏳ Downloading…";
     - on cancellation (arq timeout / worker shutdown) the progress message is
       still updated, then the cancellation is re-raised.
+    *on_fail(text)* reports the failure; default: edit the progress message.
     """
+    report = on_fail or (lambda text: _try_edit(bot, chat_id, message_id, text))
     try:
         async with asyncio.timeout(_job_deadline()):
             yield
     except TimeoutError:
         logger.warning(f"Job hit its deadline ({_job_deadline():.0f}s) for chat {chat_id}")
-        await _try_edit(bot, chat_id, message_id, t("err.job_timeout", lang))
+        await report(t("err.job_timeout", lang))
     except asyncio.CancelledError:
-        await asyncio.shield(_try_edit(bot, chat_id, message_id, t("err.job_timeout", lang)))
+        await asyncio.shield(report(t("err.job_timeout", lang)))
         raise
 
 
@@ -246,21 +248,136 @@ async def _try_instagram_photo(bot: Bot, chat_id: int, message_id: int, url: str
 
 # ── Video / MP3 download ──────────────────────────────────────────────────────
 
+_BG_TASKS: set = set()
+
+
+def _bg(coro) -> None:
+    """Fire-and-forget a cosmetic Telegram call (status text, chat action).
+
+    The download must never wait on a progress edit: each one is a full
+    Telegram round-trip on the critical path.
+    """
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_bg_done)
+
+
+def _bg_done(task: asyncio.Task) -> None:
+    _BG_TASKS.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.debug(f"Background Telegram call failed: {task.exception()}")
+
+
+def _reply_params(reply_to: Optional[int]) -> dict:
+    """reply_parameters for group chats (answer under the user's link)."""
+    if not reply_to:
+        return {}
+    from aiogram.types import ReplyParameters
+    return {"reply_parameters": ReplyParameters(message_id=reply_to,
+                                                allow_sending_without_reply=True)}
+
+
+def _safe_filename(title: str, ext: str) -> str:
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", title or "").strip()[:80].strip(" .")
+    return f"{name or 'audio'}{ext}"
+
+
+class _Progress:
+    """Where a download job reports progress, and how it cleans up.
+
+    ``text`` mode: a separate status message - deleted when the file is sent,
+    replaced by the error text on failure.
+
+    ``caption`` mode (another quality picked under a delivered video): the
+    status lives in that video's caption. On success the old video message is
+    replaced (deleted); on failure its caption and buttons come back and the
+    error is sent as a reply.
+    """
+
+    def __init__(self, bot: Bot, chat_id: int, message_id: int, mode: str,
+                 url: str, platform: str, lang: str, restore_caption: Optional[str] = None):
+        self.bot, self.chat_id, self.message_id = bot, chat_id, message_id
+        self.mode, self.url, self.platform, self.lang = mode, url, platform, lang
+        # The caption the video had before it showed the progress, so a
+        # restore gives back exactly that (🔗 link and 📺 quality included).
+        self.restore_caption = restore_caption
+        self._pending: set = set()
+
+    @property
+    def caption_mode(self) -> bool:
+        return self.mode == "caption"
+
+    def update(self, text: str) -> None:
+        if not self.caption_mode:
+            task = asyncio.create_task(_safe_edit(self.bot, self.chat_id, self.message_id, text))
+            self._pending.add(task)
+            task.add_done_callback(self._pending.discard)
+            task.add_done_callback(_bg_done)
+
+    async def _settle(self) -> None:
+        """Let in-flight status edits land first, so none can overwrite the
+        final error text (or hit an already deleted message)."""
+        if self._pending:
+            await asyncio.wait(set(self._pending), timeout=3)
+
+    async def fail(self, text: str) -> None:
+        await self._settle()
+        if not self.caption_mode:
+            await _try_edit(self.bot, self.chat_id, self.message_id, text)
+            return
+        await self._restore()
+        try:
+            await self.bot.send_message(self.chat_id, text, **_reply_params(self.message_id))
+        except Exception as e:
+            logger.debug(f"Error notice failed: {e}")
+
+    async def _restore(self) -> None:
+        """Give the video message its caption and buttons back."""
+        from bot.services.delivery import video_presentation
+        try:
+            caption, kb = await video_presentation(self.url, self.platform, "", self.lang)
+            await self.bot.edit_message_caption(chat_id=self.chat_id, message_id=self.message_id,
+                                                caption=self.restore_caption or caption,
+                                                reply_markup=kb)
+        except Exception as e:
+            logger.debug(f"Caption restore failed: {e}")
+
+    async def done(self) -> None:
+        await self._settle()
+        try:
+            await self.bot.delete_message(self.chat_id, self.message_id)
+        except Exception:
+            if self.caption_mode:
+                # Telegram refuses deletes after 48 h: the new file is already
+                # below, so the old one must not keep the "⏳" caption.
+                await self._restore()
+            else:
+                await _try_edit(self.bot, self.chat_id, self.message_id, t("dl.done", self.lang))
+
+
+async def _deliver_cached(bot: Bot, chat_id: int, url: str, platform: str, quality: str,
+                          file_id: str, lang: str, *, full: bool = False,
+                          reply_to: Optional[int] = None) -> None:
+    """Send an already-uploaded file (all parts of a split video) by file_id."""
+    from bot.services.delivery import audio_caption, register_video_buttons, send_cached_video, video_presentation
+
+    if quality == "mp3":
+        await _flood_retry(lambda: bot.send_audio(chat_id, audio=file_id, caption=audio_caption(),
+                                                  **_reply_params(reply_to)))
+        return
+    caption, kb = await video_presentation(url, platform, quality, lang, full=full)
+    await send_cached_video(
+        bot, chat_id, file_id, caption, lang, reply_markup=kb,
+        send=lambda **kw: _flood_retry(lambda: bot.send_video(**kw)),
+        **_reply_params(reply_to))
+    await register_video_buttons(url, file_id)
+
+
 async def _send_cached(bot: Bot, chat_id: int, message_id: int,
                        url: str, quality: str, file_id: str, lang: str) -> None:
-    """Send a cached file_id (or all parts of a split video) and clean up
-    the progress message."""
-    if quality == "mp3":
-        await _flood_retry(lambda: bot.send_audio(chat_id, audio=file_id, caption=CAPTION))
-    else:
-        from bot.services.delivery import send_cached_video, split_file_ids
-        shazam_key = await store_video_for_shazam(split_file_ids(file_id)[0], source_url=url)
-        url_key = await store_url_key(url)
-        from bot.keyboards.inline import video_result_keyboard
-        kb = video_result_keyboard(url_key, shazam_key, lang)
-        await send_cached_video(
-            bot, chat_id, file_id, CAPTION, lang, reply_markup=kb,
-            send=lambda **kw: _flood_retry(lambda: bot.send_video(**kw)))
+    """Send a cached file_id and delete the status message (kept for callers)."""
+    from bot.services.downloader import detect_platform
+    await _deliver_cached(bot, chat_id, url, detect_platform(url) or "", quality, file_id, lang)
     try:
         await bot.delete_message(chat_id, message_id)
     except Exception:
@@ -271,12 +388,12 @@ async def _wait_for_other_worker(url: str, quality: str) -> Optional[str]:
     """Wait while another worker downloads the same URL.
 
     Returns its cached file_id, or None once the lock is gone without a cache
-    entry (the other job failed) — the caller then downloads itself. Bounded
+    entry (the other job failed) - the caller then downloads itself. Bounded
     by the job deadline, so it never starts a duplicate download while the
     first one is still running (the old fixed 60 s budget did exactly that).
     """
     while True:
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
         file_id = await get_file_id(url, quality)
         if file_id:
             return file_id
@@ -284,20 +401,58 @@ async def _wait_for_other_worker(url: str, quality: str) -> Optional[str]:
             return await get_file_id(url, quality)
 
 
+def _youtube_thumb(url: str) -> Optional[str]:
+    from bot.services.downloader import youtube_video_id
+    vid = youtube_video_id(url)
+    return f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg" if vid else None
+
+
+async def _await_thumb(task: Optional[asyncio.Task], timeout: float = 5.0) -> Optional[str]:
+    if task is None:
+        return None
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout)
+    except Exception:
+        return None
+
+
 async def download_task(
     ctx: dict, *,
     user_id: int, chat_id: int, message_id: int,
     url: str, platform: str, quality: str, user_lang: str,
     slot_reserved: bool = False,
+    progress: str = "text",
+    reply_to: Optional[int] = None,
+    restore_caption: Optional[str] = None,
+    **unknown,
 ):
+    """Download *url* in *quality* ("360"/"480"/"720"/"1080"/"mp3") and send it.
+
+    *message_id* is the status message (``progress="text"``) or, when the
+    user picked another quality under a delivered video, that video message
+    itself (``progress="caption"``). *reply_to* threads the answer under the
+    user's link in group chats. *restore_caption* is that video's caption
+    before the progress replaced it. Unknown arguments (a job from a newer
+    bot during a rolling deploy) are ignored instead of failing the job.
+    """
+    from bot.services.cache import set_video_meta, url_key_for
+    from bot.services.delivery import (
+        audio_caption, register_video_buttons, video_presentation,
+    )
+
     bot = _get_bot(ctx)
     own_bot = bot is not ctx.get("bot")
     temp_path: Optional[str] = None
     split_source: Optional[str] = None
+    thumb_task: Optional[asyncio.Task] = None
     lang = user_lang or settings.default_lang
     t_total_start = time.monotonic()
     sf_acquired = False
     kind = "audio" if quality == "mp3" else "video"
+    if unknown:
+        logger.warning(f"download_task ignores unknown arguments: {sorted(unknown)}")
+    status = _Progress(bot, chat_id, message_id, progress, url, platform, lang, restore_caption)
+    full_caption = status.caption_mode
 
     # Jobs enqueued by current handlers reserved their slot at enqueue time;
     # jobs from an older deploy did not.
@@ -305,13 +460,15 @@ async def download_task(
         await acquire_user_slot(user_id)
 
     try:
-        async with _user_job(bot, chat_id, message_id, lang):
+        async with _user_job(bot, chat_id, message_id, lang, on_fail=status.fail):
             try:
                 # Fast path: another job for the same URL may have finished
                 # while this one waited in the queue.
                 cached = await get_file_id(url, quality)
                 if cached:
-                    await _send_cached(bot, chat_id, message_id, url, quality, cached, lang)
+                    await _deliver_cached(bot, chat_id, url, platform, quality, cached, lang,
+                                          full=full_caption, reply_to=reply_to)
+                    await status.done()
                     await _record_download(user_id, url, platform, kind, from_cache=True, file_id=cached)
                     _log_timing("download_complete", platform=platform, quality=quality,
                                 t_total=round(time.monotonic() - t_total_start, 2),
@@ -319,7 +476,9 @@ async def download_task(
                                 local_api=settings.use_local_api)
                     return
 
-                await _safe_edit(bot, chat_id, message_id, t("dl.downloading", lang))
+                # The status message already reads "⏳ Downloading..." (sent by
+                # the handler), so no edit here - only the typing-style action.
+                _bg(bot.send_chat_action(chat_id, "upload_voice" if quality == "mp3" else "upload_video"))
 
                 # Single-flight: one download per URL+quality across all workers.
                 sf_acquired = await acquire_single_flight(url, quality, ttl=settings.job_timeout)
@@ -328,7 +487,9 @@ async def download_task(
                     waited = True
                     other = await _wait_for_other_worker(url, quality)
                     if other:
-                        await _send_cached(bot, chat_id, message_id, url, quality, other, lang)
+                        await _deliver_cached(bot, chat_id, url, platform, quality, other, lang,
+                                              full=full_caption, reply_to=reply_to)
+                        await status.done()
                         await _record_download(user_id, url, platform, kind, from_cache=True, file_id=other)
                         _log_timing("download_complete", platform=platform, quality=quality,
                                     t_total=round(time.monotonic() - t_total_start, 2),
@@ -336,6 +497,12 @@ async def download_task(
                                     local_api=settings.use_local_api)
                         return
                     sf_acquired = await acquire_single_flight(url, quality, ttl=settings.job_timeout)
+
+                # The cover for an MP3 is fetched while the audio downloads.
+                if quality == "mp3":
+                    thumb_url = _youtube_thumb(url)
+                    if thumb_url:
+                        thumb_task = asyncio.create_task(_prepare_thumbnail(thumb_url))
 
                 temp_path = get_temp_path(suffix=".mp3" if quality == "mp3" else ".mp4")
                 async with _get_yt_dlp_sem():
@@ -346,6 +513,7 @@ async def download_task(
                 actual_path = result.path
                 if not os.path.exists(actual_path) or result.size_bytes == 0:
                     raise DownloadError("Download produced empty or missing file", kind="generic")
+                meta = result.meta or {}
 
                 # Too big for one upload: video is cut into parts at full
                 # quality (no re-encode); audio has no such fallback.
@@ -360,48 +528,60 @@ async def download_task(
                         logger.warning(f"Split failed for {url}: {e}")
                         raise DownloadError("Too large", kind="too_large") from e
 
-                await _safe_edit(bot, chat_id, message_id, t("dl.uploading", lang))
-                await bot.send_chat_action(chat_id, "upload_voice" if quality == "mp3" else "upload_video")
+                status.update(t("dl.uploading", lang))
+                _bg(bot.send_chat_action(chat_id, "upload_voice" if quality == "mp3" else "upload_video"))
 
                 t_up_start = time.monotonic()
                 n_parts = len(upload_paths)
                 file_ids: list[str] = []
-                for i, part in enumerate(upload_paths, 1):
-                    input_file = FSInputFile(part)
-                    if n_parts > 1:
-                        await _try_edit(bot, chat_id, message_id,
-                                        t("dl.uploading_part", lang, i=i, n=n_parts))
-                    if quality == "mp3":
-                        sent = await _flood_retry(lambda: bot.send_audio(chat_id, audio=input_file, caption=CAPTION))
-                        media = sent.audio
-                    else:
-                        cap = part_caption(CAPTION, i, n_parts, lang)
+                if quality == "mp3":
+                    if thumb_task is None and meta.get("thumbnail"):
+                        thumb_task = asyncio.create_task(_prepare_thumbnail(meta["thumbnail"]))
+                    thumb = await _await_thumb(thumb_task)
+                    title = meta.get("title") or None
+                    sent = await _flood_retry(lambda: bot.send_audio(
+                        chat_id,
+                        audio=FSInputFile(actual_path, filename=_safe_filename(meta.get("title", ""), ".mp3")),
+                        title=title,
+                        performer=meta.get("uploader") or None,
+                        duration=meta.get("duration") or None,
+                        thumbnail=FSInputFile(thumb) if thumb else None,
+                        caption=audio_caption(),
+                        **_reply_params(reply_to),
+                    ))
+                    if sent.audio is None:
+                        raise RuntimeError("Telegram response has no audio object")
+                    file_ids.append(sent.audio.file_id)
+                else:
+                    # Caption and buttons are known before the upload, so they
+                    # ride on the video itself (no follow-up edit call).
+                    caption, kb = await video_presentation(url, platform, quality, lang,
+                                                           meta=meta, full=full_caption)
+                    dims = {k: meta[k] for k in ("width", "height", "duration") if meta.get(k)}
+                    for i, part in enumerate(upload_paths, 1):
+                        input_file = FSInputFile(part)
+                        if n_parts > 1:
+                            status.update(t("dl.uploading_part", lang, i=i, n=n_parts))
+                        cap = part_caption(caption, i, n_parts, lang)
+                        extra = dict(dims) if n_parts == 1 else {
+                            k: v for k, v in dims.items() if k != "duration"}
+                        if i == 1:
+                            extra.update(_reply_params(reply_to))
                         sent = await _flood_retry(lambda: bot.send_video(
-                            chat_id, video=input_file, caption=cap, supports_streaming=True))
-                        media = sent.video
-                    if media is None:
-                        raise RuntimeError("Telegram response has no media object")
-                    file_ids.append(media.file_id)
+                            chat_id, video=input_file, caption=cap, supports_streaming=True,
+                            reply_markup=kb if i == n_parts else None, **extra))
+                        if sent.video is None:
+                            raise RuntimeError("Telegram response has no media object")
+                        file_ids.append(sent.video.file_id)
                 file_id = join_file_ids(file_ids)
                 t_upload = time.monotonic() - t_up_start
                 t_total = time.monotonic() - t_total_start
 
                 # Cache first: single-flight waiters poll for this key.
                 await set_file_id(url, quality, file_id)
-
                 if quality != "mp3":
-                    shazam_key = await store_video_for_shazam(file_ids[0], source_url=url)
-                    url_key = await store_url_key(url)
-                    from bot.keyboards.inline import video_result_keyboard
-                    try:
-                        await bot.edit_message_reply_markup(
-                            chat_id=chat_id, message_id=sent.message_id,
-                            reply_markup=video_result_keyboard(url_key, shazam_key, lang),
-                        )
-                    except Exception:
-                        pass
-
-                await _drop_progress(bot, chat_id, message_id, t("dl.done", lang))
+                    await register_video_buttons(url, file_id, meta)
+                await status.done()
 
                 _log_timing("download_complete",
                             platform=platform, quality=quality,
@@ -427,16 +607,19 @@ async def download_task(
 
             except DownloadError as e:
                 # Instagram photo post fallback: send as photo instead of an error
-                if e.kind == "no_video" and platform == "instagram":
+                if e.kind == "no_video" and platform == "instagram" and not status.caption_mode:
                     if await _try_instagram_photo(bot, chat_id, message_id, url):
                         return
                 logger.info(f"Download failed ({e.kind}): {str(e)[:200]}")
                 limit_mb = (settings.max_video_bytes if kind == "video" else settings.max_file_bytes) // 1048576
-                await _try_edit(bot, chat_id, message_id, error_text(e.kind, lang, mb=limit_mb))
+                await status.fail(error_text(e.kind, lang, mb=limit_mb))
             except Exception as e:
                 logger.error(f"Download task error: {e}", exc_info=True)
-                await _try_edit(bot, chat_id, message_id, t("err.generic", lang))
+                await status.fail(t("err.generic", lang))
     finally:
+        if thumb_task is not None:
+            thumb_task.add_done_callback(lambda tk: safe_delete(tk.result()) if not tk.cancelled()
+                                         and tk.exception() is None and tk.result() else None)
         if split_source:
             remove_parts(split_source)
         if temp_path:
@@ -517,19 +700,75 @@ async def recognize_task(
                     await _safe_edit(bot, chat_id, message_id, t("shz.not_found", lang))
                     return
 
+                # The card goes out right after recognition; lyrics (up to
+                # ~50 s across providers on a miss) are looked up afterwards
+                # and their button is added to the card when found.
                 lyrics = result.lyrics
-                if not lyrics:
-                    from bot.services.lyrics import get_lyrics
-                    lyrics = await get_lyrics(result.title, result.artist)
-
-                from bot.services.cache import set_song_cache
-                await set_song_cache(result.title, result.artist, {
+                song_data = {
                     "coverart": result.coverart,
                     "apple_url": result.apple_url,
                     "shazam_url": result.shazam_url,
                     "spotify_url": result.spotify_url,
                     "lyrics": lyrics,
-                })
+                }
+                from bot.services.cache import set_song_cache
+                try:
+                    await set_song_cache(result.title, result.artist, song_data)
+                except Exception as e:
+                    logger.warning(f"Song cache write failed: {e}")
+
+                from bot.keyboards.inline import song_card_keyboard
+                song_key = await store_song_meta(result.title, result.artist)
+
+                def card_keyboard(with_lyrics: bool):
+                    return song_card_keyboard(
+                        apple_url=result.apple_url,
+                        shazam_url=result.shazam_url,
+                        has_lyrics=with_lyrics,
+                        song_key=song_key,
+                        lang=lang,
+                        spotify_url=result.spotify_url,
+                    )
+
+                # Shazam metadata is external text: escape before HTML.
+                caption = f"🎵 <b>{esc(result.title)}</b>\n👤 {esc(result.artist)}"
+                card_id: Optional[int] = None
+                if result.coverart:
+                    try:
+                        card = await _flood_retry(lambda: bot.send_photo(
+                            chat_id, photo=result.coverart, caption=caption,
+                            parse_mode="HTML", reply_markup=card_keyboard(bool(lyrics))))
+                        card_id = card.message_id
+                        try:
+                            await bot.delete_message(chat_id, message_id)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        logger.warning(f"Cover art send failed, falling back to text: {e}")
+                if card_id is None:
+                    await _safe_edit(bot, chat_id, message_id, caption, parse_mode="HTML",
+                                     reply_markup=card_keyboard(bool(lyrics)))
+                    card_id = message_id
+
+                if not lyrics:
+                    from bot.services.lyrics import get_lyrics
+                    try:
+                        async with asyncio.timeout(30):
+                            lyrics = await get_lyrics(result.title, result.artist)
+                    except Exception as e:
+                        logger.info(f"Lyrics lookup gave up: {type(e).__name__}: {e}")
+                        lyrics = None
+                    if lyrics:
+                        song_data["lyrics"] = lyrics
+                        try:
+                            await set_song_cache(result.title, result.artist, song_data)
+                        except Exception:
+                            pass
+                        try:
+                            await bot.edit_message_reply_markup(
+                                chat_id=chat_id, message_id=card_id, reply_markup=card_keyboard(True))
+                        except Exception as e:
+                            logger.debug(f"Lyrics button not added: {e}")
 
                 try:
                     from bot.db.repo import RecognitionRepo, SongCacheRepo, UserRepo
@@ -544,33 +783,6 @@ async def recognize_task(
                         await UserRepo(session).touch(user_id)
                 except Exception as e:
                     logger.warning(f"Song DB save failed: {e}")
-
-                from bot.keyboards.inline import song_card_keyboard
-                song_key = await store_song_meta(result.title, result.artist)
-                kb = song_card_keyboard(
-                    apple_url=result.apple_url,
-                    shazam_url=result.shazam_url,
-                    has_lyrics=bool(lyrics),
-                    song_key=song_key,
-                    lang=lang,
-                    spotify_url=result.spotify_url,
-                )
-                # Shazam metadata is external text: escape before HTML.
-                caption = f"🎵 <b>{esc(result.title)}</b>\n👤 {esc(result.artist)}"
-
-                if result.coverart:
-                    try:
-                        await _flood_retry(lambda: bot.send_photo(
-                            chat_id, photo=result.coverart, caption=caption,
-                            parse_mode="HTML", reply_markup=kb))
-                        try:
-                            await bot.delete_message(chat_id, message_id)
-                        except Exception:
-                            pass
-                        return
-                    except Exception as e:
-                        logger.warning(f"Cover art send failed, falling back to text: {e}")
-                await _safe_edit(bot, chat_id, message_id, caption, parse_mode="HTML", reply_markup=kb)
 
             except Exception as e:
                 logger.error(f"Recognize task error: {e}", exc_info=True)
@@ -833,6 +1045,7 @@ class WorkerSettings:
     queue_name = "arq:queue"
     max_jobs = settings.worker_concurrency
     job_timeout = settings.job_timeout
+    poll_delay = settings.queue_poll_delay
     keep_result = 60
     on_startup = worker_startup
     on_shutdown = worker_shutdown
@@ -847,6 +1060,7 @@ class RecognitionWorkerSettings:
     queue_name = "arq:queue:recognition"
     max_jobs = settings.worker_concurrency
     job_timeout = settings.job_timeout
+    poll_delay = settings.queue_poll_delay
     keep_result = 60
     on_startup = worker_startup
     on_shutdown = worker_shutdown
@@ -859,6 +1073,7 @@ class MusicWorkerSettings:
     queue_name = "arq:queue:music"
     max_jobs = settings.worker_concurrency
     job_timeout = settings.job_timeout
+    poll_delay = settings.queue_poll_delay
     keep_result = 60
     on_startup = worker_startup
     on_shutdown = worker_shutdown

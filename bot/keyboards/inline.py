@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Iterable, Optional
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.services.music_search import LONG_TRACK_SECONDS, SongEntry, format_duration
-from bot.texts import T, t
+from bot.config import settings
+from bot.texts import LANG_NAMES, LANGS, T, t
 from bot.utils.text import esc, safe_https_url
 
-LANG_FLAGS = {"uz": "🇺🇿 O'zbek", "ru": "🇷🇺 Русский", "en": "🇬🇧 English"}
+LANG_FLAGS = LANG_NAMES
 
 # Label dicts (views into bot.texts.T — the single source of strings)
 LISTEN_LABELS = T["btn.listen"]
@@ -23,22 +24,62 @@ SUBSCRIBED_LABELS = T["channel.check_btn"]
 
 
 def lang_keyboard() -> InlineKeyboardMarkup:
+    """Four languages in a 2x2 grid: Latin and Cyrillic Uzbek side by side."""
     builder = InlineKeyboardBuilder()
+    buttons = [InlineKeyboardButton(text=LANG_NAMES[code], callback_data=f"lang:{code}")
+               for code in LANGS]
+    for i in range(0, len(buttons), 2):
+        builder.row(*buttons[i:i + 2])
+    return builder.as_markup()
+
+
+def add_to_group_url() -> str:
+    return f"https://t.me/{settings.bot_username}?startgroup=true"
+
+
+def welcome_keyboard(lang: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text=t("btn.add_group", lang), url=add_to_group_url()))
+    return builder.as_markup()
+
+
+def quality_label(quality, ready: bool) -> str:
+    """"🎬 480p" when the file is ready, "🎬 480p (⏳)" when it must be fetched."""
+    return f"🎬 {quality}p" if ready else f"🎬 {quality}p (⏳)"
+
+
+def video_keyboard(
+    url_key: str,
+    lang: str,
+    qualities: Iterable[int] = (),
+    ready: Iterable[str] = (),
+    shazam_key: Optional[str] = None,
+) -> InlineKeyboardMarkup:
+    """Buttons under a delivered video.
+
+    Row(s) 1: one button per available quality (two per row); qualities that
+    are not cached yet carry an hourglass. Last row: audio + find the song.
+    """
+    ready_set = {str(q) for q in ready}
+    builder = InlineKeyboardBuilder()
+    q_buttons = [
+        InlineKeyboardButton(text=quality_label(q, str(q) in ready_set),
+                             callback_data=f"vq:{q}:{url_key}")
+        for q in qualities
+    ]
+    for i in range(0, len(q_buttons), 2):
+        builder.row(*q_buttons[i:i + 2])
     builder.row(
-        InlineKeyboardButton(text="🇺🇿 O'zbek", callback_data="lang:uz"),
-        InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang:ru"),
-        InlineKeyboardButton(text="🇬🇧 English", callback_data="lang:en"),
+        InlineKeyboardButton(text=t("btn.audio", lang), callback_data=f"vdalt:mp3:{url_key}"),
+        InlineKeyboardButton(text=t("btn.find_song", lang),
+                             callback_data=f"vshz:{shazam_key or url_key}"),
     )
     return builder.as_markup()
 
 
 def video_result_keyboard(url_key: str, shazam_key: str, lang: str) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text=t("btn.find_song", lang), callback_data=f"vshz:{shazam_key}"),
-        InlineKeyboardButton(text=t("btn.mp3", lang), callback_data=f"vdalt:mp3:{url_key}"),
-    )
-    return builder.as_markup()
+    """Audio + find-song only (no quality row)."""
+    return video_keyboard(url_key, lang, shazam_key=shazam_key)
 
 
 def song_card_keyboard(
@@ -106,10 +147,13 @@ def music_search_keyboard(
     lines = []
     for i, entry in enumerate(page_entries, start=1):
         num = start + i
-        dur = format_duration(entry.duration)
+        dur = format_duration(entry.duration) if entry.duration else ""
         long_mark = f" {t('btn.long', lang)}" if entry.duration > LONG_TRACK_SECONDS else ""
+        # The YouTube title usually already is "Artist - Song"; fall back to
+        # "uploader - title" only when the title names no artist.
+        name = entry.title if " - " in entry.title or not entry.uploader else f"{entry.uploader} - {entry.title}"
         # YouTube titles/uploaders are attacker-controlled: escape before HTML
-        lines.append(f"{num}. <b>{esc(entry.uploader)}</b> — {esc(entry.title)}  <code>{dur}</code>{long_mark}")
+        lines.append(f"{num}. {esc(name)}  {dur}{long_mark}".rstrip())
 
     text = "\n".join(lines)
 
@@ -129,9 +173,9 @@ def music_search_keyboard(
     # Pagination
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"msp:{qhash}:{page-1}"))
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"msp:{qhash}:{page-1}"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"msp:{qhash}:{page+1}"))
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"msp:{qhash}:{page+1}"))
     if nav:
         builder.row(*nav)
 
@@ -186,6 +230,9 @@ def admin_welcome_lang_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="🇺🇿 O'zbek", callback_data="adm:wl_uz"),
+        InlineKeyboardButton(text="🇺🇿 Ўзбекча", callback_data="adm:wl_oz"),
+    )
+    builder.row(
         InlineKeyboardButton(text="🇷🇺 Русский", callback_data="adm:wl_ru"),
         InlineKeyboardButton(text="🇬🇧 English", callback_data="adm:wl_en"),
     )

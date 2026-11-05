@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 from dataclasses import asdict
@@ -18,6 +19,7 @@ from bot.services.cache import (
 )
 from bot.services.music_search import SongEntry, normalize_query, search_songs
 from bot.texts import T, t
+from bot.utils.text import esc
 
 router = Router()
 router.message.filter(F.chat.type == ChatType.PRIVATE)
@@ -56,8 +58,10 @@ async def handle_music_search(message: Message, user_lang: str):
         await message.answer(t("music.query_short", lang))
         return
 
-    await message.bot.send_chat_action(message.chat.id, "typing")
-    progress_msg = await message.answer(t("music.searching", lang))
+    # No "searching..." placeholder: the list itself is the first answer
+    # (one message instead of send + edit); "typing" covers the wait.
+    typing = asyncio.ensure_future(message.bot.send_chat_action(message.chat.id, "typing"))
+    typing.add_done_callback(lambda tk: tk.cancelled() or tk.exception())
 
     # Same query within MUSIC_SEARCH_TTL → no YouTube round-trip at all.
     cached = None
@@ -72,14 +76,15 @@ async def handle_music_search(message: Message, user_lang: str):
     else:
         entries = await search_songs(query, max_results=30)
         if not entries:
-            await progress_msg.edit_text(t("music.not_found", lang))
+            await message.answer(t("music.not_found", lang))
             return
         unique = _dedupe(entries)
         qhash = await set_music_search(query, [asdict(e) for e in unique])
 
     total_pages = max(1, math.ceil(len(unique) / PAGE_SIZE))
     text, kb = music_search_keyboard(qhash, unique, page=0, total_pages=total_pages, lang=lang)
-    await progress_msg.edit_text(f"{t('music.results', lang)}\n\n{text}", parse_mode="HTML", reply_markup=kb)
+    header = t("music.results_for", lang, query=esc(query))
+    await message.answer(f"{header}\n\n{text}", parse_mode="HTML", reply_markup=kb)
 
     try:
         from bot.db.session import async_session_factory
@@ -115,8 +120,16 @@ async def cb_music_page(callback: CallbackQuery, user_lang: str = "uz"):
     page = max(0, min(page, total_pages - 1))
 
     text, kb = music_search_keyboard(qhash, entries, page=page, total_pages=total_pages, lang=lang)
+    # Keep the list's header (the user's query) from the message itself.
+    header = t("music.results", lang)
     try:
-        await callback.message.edit_text(f"{t('music.results', lang)}\n\n{text}", parse_mode="HTML", reply_markup=kb)
+        current = callback.message.html_text or ""
+        if "\n\n" in current:
+            header = current.split("\n\n", 1)[0]
+    except Exception:
+        pass
+    try:
+        await callback.message.edit_text(f"{header}\n\n{text}", parse_mode="HTML", reply_markup=kb)
     except Exception:
         pass
     await callback.answer()

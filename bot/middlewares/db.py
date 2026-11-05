@@ -4,6 +4,7 @@ import logging
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from aiogram import BaseMiddleware
+from aiogram.enums import ChatType
 from aiogram.types import TelegramObject, User
 
 from bot.db.repo import DownloadRepo, SongCacheRepo, UserRepo, guess_lang
@@ -36,7 +37,11 @@ class DbMiddleware(BaseMiddleware):
             data["song_repo"] = SongCacheRepo(session)
 
             tg_user: Optional[User] = data.get("event_from_user")
-            if tg_user is not None and not tg_user.is_bot:
+            # A group member who never opened the bot is not its user: no row
+            # (stats, broadcasts) until they write to it in private.
+            chat = data.get("event_chat")
+            private = chat is None or getattr(chat, "type", ChatType.PRIVATE) == ChatType.PRIVATE
+            if tg_user is not None and not tg_user.is_bot and private:
                 await register_user(user_repo, tg_user)
             return await handler(event, data)
 

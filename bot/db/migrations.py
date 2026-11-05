@@ -17,7 +17,7 @@ import os
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from bot.texts import DEFAULT_WELCOME
+from bot.texts import DEFAULT_WELCOME, LEGACY_DEFAULT_WELCOMES
 
 logger = logging.getLogger("yuklaydi.migrations")
 
@@ -62,6 +62,16 @@ async def seed_defaults(engine: AsyncEngine) -> None:
                      "ON CONFLICT (lang) DO NOTHING"),
                 {"lang": lang, "text": txt},
             )
+            # A row still holding an older built-in default was never edited
+            # by an admin: move it to the current default.
+            for legacy in LEGACY_DEFAULT_WELCOMES:
+                old = legacy.get(lang)
+                if old and old != txt:
+                    await conn.execute(
+                        text("UPDATE welcome_messages SET text = :new "
+                             "WHERE lang = :lang AND text = :old"),
+                        {"lang": lang, "new": txt, "old": old},
+                    )
         for key, value in _DEFAULT_SETTINGS.items():
             await conn.execute(
                 text("INSERT INTO settings (key, value) VALUES (:key, :value) "

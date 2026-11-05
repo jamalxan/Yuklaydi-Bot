@@ -4,6 +4,7 @@ import logging
 from typing import Any, Awaitable, Callable, Dict
 
 from aiogram import BaseMiddleware
+from aiogram.enums import ChatType
 from aiogram.types import CallbackQuery, Message, TelegramObject
 
 from bot.config import settings
@@ -65,6 +66,8 @@ class ThrottlingMiddleware(BaseMiddleware):
                 logger.warning(f"Rate limit check skipped (Redis error): {e}")
                 return await handler(event, data)
             if not allowed:
-                await event.answer(t("throttle", await _lang(user.id, data), sec=remaining))
+                # In a group the notice would be noise for everyone else.
+                if getattr(getattr(event, "chat", None), "type", ChatType.PRIVATE) == ChatType.PRIVATE:
+                    await event.answer(t("throttle", await _lang(user.id, data), sec=remaining))
                 return None
         return await handler(event, data)

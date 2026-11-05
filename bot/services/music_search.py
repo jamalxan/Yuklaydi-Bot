@@ -9,8 +9,8 @@ from typing import Optional
 from bot.config import settings
 from bot.logger import logger
 from bot.services.downloader import (
-    apply_proxy, build_base_opts, format_selector, open_ydl, resolve_output_path, run_ydl,
-    strip_media_ext,
+    apply_proxy, build_base_opts, format_selector, open_ydl, proxy_for, resolve_output_path,
+    run_ydl, strip_media_ext,
 )
 
 # Results longer than this (mixes, full albums) are flagged in the result list.
@@ -62,6 +62,7 @@ class SongEntry:
 
 def clean_title(title: str) -> str:
     cleaned = _CLEAN_RE.sub("", title)
+    cleaned = re.sub(r"[\(\[]\s*[\)\]]", "", cleaned)  # "()" left behind by the cut
     return re.sub(r"\s{2,}", " ", cleaned).strip(" -|–")
 
 
@@ -97,6 +98,19 @@ def _search_sync(query: str, max_results: int) -> list[dict]:
 
 
 async def search_songs(query: str, max_results: int = 30) -> list[SongEntry]:
+    # Fast path: one HTTP call (~0.5 s). Skipped when YouTube must go through
+    # the proxy; any failure falls through to yt-dlp below.
+    if not proxy_for("https://www.youtube.com/"):
+        try:
+            from bot.services import yt_search
+            hits = await yt_search.search(query)
+            if hits:
+                entries = [_parse_entry(h) for h in hits]
+                found = [e for e in entries if e is not None]
+                if found:
+                    return found[:max_results]
+        except Exception as e:
+            logger.warning(f"Fast search failed, using yt-dlp: {e}")
     try:
         loop = asyncio.get_running_loop()
         raw = await loop.run_in_executor(_search_pool(), _search_sync, query, max_results)

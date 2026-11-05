@@ -1,7 +1,9 @@
-"""Single source of every user-facing string (uz / ru / en).
+"""Single source of every user-facing string (uz / oz / ru / en).
 
 Rules:
-- Every key MUST exist in all three languages (enforced by tests/test_i18n.py).
+- Every key MUST exist in uz, ru and en (enforced by tests/test_i18n.py).
+  "oz" (Uzbek Cyrillic) is generated from "uz" by bot.utils.translit unless a
+  key spells it out itself.
 - Values may contain HTML (the bot uses parse_mode=HTML) and ``{placeholders}``
   filled by :func:`t`. Placeholder VALUES coming from outside (titles, names)
   must be escaped by the caller with ``bot.utils.text.esc``.
@@ -9,8 +11,11 @@ Rules:
 from __future__ import annotations
 
 from bot.config import settings
+from bot.utils.translit import to_cyrillic
 
-LANGS = ("uz", "ru", "en")
+# Order = order of the buttons in the language picker.
+LANGS = ("uz", "oz", "ru", "en")
+LANG_NAMES = {"uz": "🇺🇿 Oʻzbekcha", "oz": "🇺🇿 Ўзбекча", "ru": "🇷🇺 Русский", "en": "🇬🇧 English"}
 
 T: dict[str, dict[str, str]] = {
     # ── Download progress ────────────────────────────────────────────────────
@@ -66,6 +71,8 @@ T: dict[str, dict[str, str]] = {
     "music.error":       {"uz": "❌ Xatolik. Keyinroq urinib ko'ring.", "ru": "❌ Ошибка. Попробуйте позже.", "en": "❌ Error. Please try again later."},
     "music.expired":     {"uz": "Sessiya tugagan. Qaytadan qidiring.", "ru": "Сессия устарела. Повторите поиск.", "en": "Session expired. Please search again."},
     "music.results":     {"uz": "🎵 <b>Natijalar:</b>", "ru": "🎵 <b>Результаты:</b>", "en": "🎵 <b>Results:</b>"},
+    # Header of a search result list: the user's own query.
+    "music.results_for": {"uz": "🔎 <b>{query}</b>", "ru": "🔎 <b>{query}</b>", "en": "🔎 <b>{query}</b>"},
     "music.query_short": {"uz": "✏️ Qo'shiq nomini to'liqroq yozing.", "ru": "✏️ Напишите название песни подробнее.", "en": "✏️ Please type a longer song name."},
     "music.unsupported": {
         "uz": "📎 Havola → video, matn → qidiruv, ovozli xabar → qo'shiq aniqlash 🎵",
@@ -75,9 +82,15 @@ T: dict[str, dict[str, str]] = {
 
     # ── Start / language / help ──────────────────────────────────────────────
     "start.choose_lang": {
-        "uz": "👋 Assalomu alaykum! / Добро пожаловать! / Welcome!\n\nTilni tanlang / Выберите язык / Choose your language:",
-        "ru": "👋 Assalomu alaykum! / Добро пожаловать! / Welcome!\n\nTilni tanlang / Выберите язык / Choose your language:",
-        "en": "👋 Assalomu alaykum! / Добро пожаловать! / Welcome!\n\nTilni tanlang / Выберите язык / Choose your language:",
+        "uz": "🌐 Tilni tanlang · Тилни танланг · Выберите язык · Choose your language",
+        "oz": "🌐 Tilni tanlang · Тилни танланг · Выберите язык · Choose your language",
+        "ru": "🌐 Tilni tanlang · Тилни танланг · Выберите язык · Choose your language",
+        "en": "🌐 Tilni tanlang · Тилни танланг · Выберите язык · Choose your language",
+    },
+    "group.hello": {
+        "uz": "👋 Salom! Guruhga YouTube, Instagram yoki TikTok havolasini tashlang — videoni shu yerga yuklab beraman.",
+        "ru": "👋 Привет! Бросьте в группу ссылку на YouTube, Instagram или TikTok — пришлю видео прямо сюда.",
+        "en": "👋 Hi! Drop a YouTube, Instagram or TikTok link in this group and I'll post the video right here.",
     },
     "start.lang_saved":  {"uz": "✅ Til saqlandi!", "ru": "✅ Язык сохранён!", "en": "✅ Language saved!"},
     "start.lang_prompt": {"uz": "🌐 Tilni tanlang:", "ru": "🌐 Выберите язык:", "en": "🌐 Select language:"},
@@ -134,6 +147,8 @@ T: dict[str, dict[str, str]] = {
     "btn.lyrics":    {"uz": "📝 Qo'shiq matni", "ru": "📝 Текст песни", "en": "📝 Lyrics"},
     "btn.find_song": {"uz": "🎵 Qo'shiqni top", "ru": "🎵 Найти песню", "en": "🎵 Find song"},
     "btn.mp3":       {"uz": "🎧 Audio sifatida olish", "ru": "🎧 Получить аудио", "en": "🎧 Get as audio"},
+    "btn.audio":     {"uz": "🎶 Audio", "ru": "🎶 Аудио", "en": "🎶 Audio"},
+    "btn.add_group": {"uz": "➕ Guruhga qo'shish", "ru": "➕ Добавить в группу", "en": "➕ Add to group"},
     "btn.hd":        {"uz": "🎬 1080p", "ru": "🎬 1080p", "en": "🎬 1080p"},
     "btn.dl_song":   {"uz": "⬇️ MP3 yuklab olish", "ru": "⬇️ Скачать MP3", "en": "⬇️ Download MP3"},
     "btn.retry":     {"uz": "🔁 Qayta", "ru": "🔁 Повторить", "en": "🔁 Retry"},
@@ -148,6 +163,35 @@ T: dict[str, dict[str, str]] = {
 # Default /start welcome (admin can override per language in the DB).
 # {first_name} / {username} are filled by handlers.start._render (escaped).
 DEFAULT_WELCOME: dict[str, str] = {
+    "uz": (
+        "👋 Salom, <b>{first_name}</b>!\n\n"
+        "Men nimalar qila olaman:\n\n"
+        "🎬 YouTube, Instagram, TikTok va boshqa saytlardagi videoni havolasi orqali tez yuklab beraman\n\n"
+        "🎵 Qo'shiq nomi, ijrochisi yoki matnidan bir qator yozsangiz — MP3 topib beraman\n\n"
+        "🎤 Ovozli xabar, video yoki audiodagi qo'shiqni aniqlab, to'liq holda topib beraman\n\n"
+        "👇 Boshlash uchun havola yoki qo'shiq nomini yuboring"
+    ),
+    "ru": (
+        "👋 Привет, <b>{first_name}</b>!\n\n"
+        "Вот что я умею:\n\n"
+        "🎬 Быстро скачиваю видео из YouTube, Instagram, TikTok и других сайтов по ссылке\n\n"
+        "🎵 Нахожу MP3 по названию песни, исполнителю или строчке из текста\n\n"
+        "🎤 Узнаю песню в голосовом, видео или аудио и присылаю её целиком\n\n"
+        "👇 Отправьте ссылку или название песни"
+    ),
+    "en": (
+        "👋 Hi, <b>{first_name}</b>!\n\n"
+        "Here is what I can do:\n\n"
+        "🎬 Quickly download videos from YouTube, Instagram, TikTok and other sites by link\n\n"
+        "🎵 Find the MP3 by song title, artist or a line of the lyrics\n\n"
+        "🎤 Recognize the song in a voice message, video or audio and send the full track\n\n"
+        "👇 Send a link or a song name to start"
+    ),
+}
+
+# Earlier built-in welcomes. Stored rows still equal to one of these were never
+# customised by an admin, so migrations.seed_defaults upgrades them.
+LEGACY_DEFAULT_WELCOMES: tuple[dict[str, str], ...] = ({
     "uz": (
         "👋 Salom, <b>{first_name}</b>!\n\n"
         "🎬 Havola yuboring — video yuklab beraman.\n"
@@ -169,7 +213,14 @@ DEFAULT_WELCOME: dict[str, str] = {
         "🎤 Send a voice message — I'll find the song.\n\n"
         "<i>🤖 @vidyuklaydi_bot</i>"
     ),
-}
+},)
+
+
+# Uzbek Cyrillic is derived from Uzbek Latin (explicit "oz" values win).
+for _entry in T.values():
+    if "oz" not in _entry and "uz" in _entry:
+        _entry["oz"] = to_cyrillic(_entry["uz"])
+DEFAULT_WELCOME.setdefault("oz", to_cyrillic(DEFAULT_WELCOME["uz"]))
 
 
 def t(key: str, lang: str | None = None, **fmt) -> str:
