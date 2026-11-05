@@ -132,44 +132,90 @@ async def extract_audio_snippet(
     return output_path
 
 
-def safe_delete(path: str) -> None:
+def _delete_once(path: str) -> bool:
+    """Try to delete *path*. True = gone (or never existed); False = locked."""
+    try:
+        os.remove(path)
+        return True
+    except FileNotFoundError:
+        return True
+    except PermissionError:
+        return False  # Windows: still held by the HTTP client (WinError 32)
+    except Exception as e:
+        logger.warning(f"Failed to delete temp file {path}: {e}")
+        return True  # not retryable
+
+
+def safe_delete(path: str | None) -> None:
+    """Delete a temp file without ever blocking or raising.
+
+    One attempt only — this is called from async code, and the old
+    time.sleep() retry froze the event loop. A file that is still locked is
+    left for the periodic cleanup task (see safe_delete_async for retries).
+    """
     if not path:
         return
-    # On Windows a just-uploaded file can still be held by the HTTP client for
-    # a moment (WinError 32) — retry briefly before giving up. Leftovers are
-    # swept by the hourly cleanup task either way.
-    import time
-    for attempt in range(3):
-        try:
-            if os.path.exists(path):
-                os.remove(path)
+    if not _delete_once(path):
+        logger.debug(f"Temp file locked, leaving for cleanup task: {path}")
+
+
+async def safe_delete_async(path: str | None, attempts: int = 3, delay: float = 0.4) -> None:
+    """Async delete with non-blocking retries for briefly locked files."""
+    if not path:
+        return
+    for attempt in range(attempts):
+        if _delete_once(path):
             return
-        except PermissionError:
-            if attempt < 2:
-                time.sleep(0.4)
-        except Exception as e:
-            logger.warning(f"Failed to delete temp file {path}: {e}")
-            return
+        if attempt < attempts - 1:
+            await asyncio.sleep(delay)
     logger.warning(f"Temp file still locked, leaving for cleanup task: {path}")
 
 
-async def cleanup_old_files(directory: str, max_age_seconds: int = 3600) -> None:
+# Only files we create ourselves are ever swept (see get_temp_path callers).
+TEMP_PREFIXES = ("ydl_", "shz_", "shz_in_", "mus_", "th_", "exp_")
+
+
+def temp_dir() -> str:
+    """Private scratch dir for our temp files: <download_dir>/tmp.
+
+    download_dir itself is shared with the Local Bot API (its files live
+    there) and historically held cookies.txt — the cleanup job must never
+    touch anything outside this subdirectory.
+    """
+    from bot.config import settings
+    path = os.path.join(settings.download_dir, "tmp")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+async def cleanup_old_files(directory: str | None = None, max_age_seconds: int = 3600) -> int:
+    """Delete our own stale temp files (prefix-matched) from the tmp dir.
+
+    Returns the number of files removed. Anything without one of
+    TEMP_PREFIXES — cookies, Local Bot API data, user files — is left alone.
+    """
     import time
+    directory = directory or temp_dir()
     now = time.time()
+    removed = 0
     try:
         for fname in os.listdir(directory):
+            if not fname.startswith(TEMP_PREFIXES):
+                continue
             fpath = os.path.join(directory, fname)
-            if os.path.isfile(fpath):
-                if now - os.path.getmtime(fpath) > max_age_seconds:
-                    safe_delete(fpath)
+            try:
+                if os.path.isfile(fpath) and now - os.path.getmtime(fpath) > max_age_seconds:
+                    if _delete_once(fpath) and not os.path.exists(fpath):
+                        removed += 1
+            except OSError:
+                continue
     except Exception as e:
         logger.error(f"Cleanup error: {e}")
+    return removed
 
 
 def get_temp_path(suffix: str = ".mp4", prefix: str = "ydl_") -> str:
-    from bot.config import settings
-    os.makedirs(settings.download_dir, exist_ok=True)
-    fd, path = tempfile.mkstemp(suffix=suffix, prefix=prefix, dir=settings.download_dir)
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix=prefix, dir=temp_dir())
     os.close(fd)
     # Remove the empty placeholder so yt-dlp/ffmpeg can write to this path cleanly.
     # The unique name is reserved; no other mkstemp call will reuse it in this process.

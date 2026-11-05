@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable, Dict
+import logging
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from aiogram import BaseMiddleware
-from aiogram.types import InlineKeyboardButton, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, Message, TelegramObject
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.db.repo import SettingRepo
@@ -11,17 +12,29 @@ from bot.db.session import async_session_factory
 from bot.services.cache import (
     get_cached_membership, get_setting, set_cached_membership, set_setting_cache,
 )
+from bot.texts import T, t
+from bot.utils.text import esc
 
+logger = logging.getLogger("yuklaydi.channel")
 
+# Commands that always work, compared EXACTLY (``/startxyz`` is not ``/start``).
 _SKIP_COMMANDS = {"/start", "/admin", "/lang", "/help", "/statistics"}
 
-_JOIN_MSGS = {
-    "uz": "📢 Botdan foydalanish uchun kanalga obuna bo'ling:",
-    "ru": "📢 Подпишитесь на канал, чтобы пользоваться ботом:",
-    "en": "📢 Subscribe to the channel to use the bot:",
-}
-_JOIN_BTN = {"uz": "📢 Kanalga o'tish", "ru": "📢 Перейти в канал", "en": "📢 Join channel"}
-_CHECK_BTN = {"uz": "✅ Obuna bo'ldim", "ru": "✅ Я подписался", "en": "✅ I subscribed"}
+# Callbacks that must work for non-subscribers: the subscription check itself,
+# the language picker and the admin panel.
+_SKIP_CALLBACK_PREFIXES = ("channel:check", "lang:", "adm:")
+
+# Backwards-compatible views of the localized strings (tests import these).
+_JOIN_MSGS = T["channel.join"]
+_JOIN_BTN = T["channel.join_btn"]
+_CHECK_BTN = T["channel.check_btn"]
+
+
+def command_of(text: Optional[str]) -> Optional[str]:
+    """'/start@MyBot payload' → '/start'; None for non-commands."""
+    if not text or not text.startswith("/"):
+        return None
+    return text.split()[0].split("@")[0].lower()
 
 
 async def _get_channel_id() -> str:
@@ -38,27 +51,35 @@ async def _get_channel_id() -> str:
 
 
 class ChannelCheckMiddleware(BaseMiddleware):
+    """Require a channel subscription for messages AND button presses."""
+
     async def __call__(
         self,
-        handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
-        event: Message,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
         data: Dict[str, Any],
     ) -> Any:
-        # Skip command messages that should always work
-        if event.text and any(event.text.startswith(cmd) for cmd in _SKIP_COMMANDS):
+        is_callback = isinstance(event, CallbackQuery)
+        if is_callback:
+            if (event.data or "").startswith(_SKIP_CALLBACK_PREFIXES):
+                return await handler(event, data)
+        elif command_of(getattr(event, "text", None)) in _SKIP_COMMANDS:
             return await handler(event, data)
 
-        ch_id_str = await _get_channel_id()
+        try:
+            ch_id_str = await _get_channel_id()
+        except Exception:
+            ch_id_str = ""
         if not ch_id_str:
             return await handler(event, data)
 
-        user_id = event.from_user.id if event.from_user else None
+        user_id = event.from_user.id if getattr(event, "from_user", None) else None
         if not user_id:
             return await handler(event, data)
 
         # Redis-cached membership — get_chat_member is a Telegram API round-trip
-        # and must NOT run on every message at high load. Cache errors fail
-        # open to the live API check.
+        # and must NOT run on every message at high load. Cache errors fall
+        # back to the live API check.
         try:
             cached = await get_cached_membership(user_id)
         except Exception:
@@ -70,7 +91,11 @@ class ChannelCheckMiddleware(BaseMiddleware):
             try:
                 member = await event.bot.get_chat_member(int(ch_id_str), user_id)
                 is_member = member.status in ("member", "administrator", "creator")
-            except Exception:
+            except Exception as e:
+                # Fail open: a misconfigured channel must not lock every user
+                # out. The admin panel verifies the bot is a channel admin
+                # before saving, so this only fires on transient API errors.
+                logger.warning(f"get_chat_member failed for channel {ch_id_str}: {e}")
                 return await handler(event, data)
             try:
                 await set_cached_membership(user_id, is_member)
@@ -79,8 +104,22 @@ class ChannelCheckMiddleware(BaseMiddleware):
             if is_member:
                 return await handler(event, data)
 
-        # User not subscribed — send join prompt
         lang = data.get("user_lang", "uz")
+        if is_callback:
+            try:
+                await event.answer(t("channel.join", lang), show_alert=True)
+            except Exception:
+                pass
+            target: Optional[Message] = event.message if isinstance(event.message, Message) else None
+            if target is None:
+                return None
+        else:
+            target = event
+        await self._send_join_prompt(target, lang)
+        return None  # don't call the handler — stop processing
+
+    @staticmethod
+    async def _send_join_prompt(target: Message, lang: str) -> None:
         try:
             async with async_session_factory() as session:
                 repo = SettingRepo(session)
@@ -91,18 +130,8 @@ class ChannelCheckMiddleware(BaseMiddleware):
 
         builder = InlineKeyboardBuilder()
         if ch_url:
-            builder.row(InlineKeyboardButton(
-                text=_JOIN_BTN.get(lang, _JOIN_BTN["en"]),
-                url=ch_url,
-            ))
-        builder.row(InlineKeyboardButton(
-            text=_CHECK_BTN.get(lang, _CHECK_BTN["en"]),
-            callback_data="channel:check",
-        ))
+            builder.row(InlineKeyboardButton(text=t("channel.join_btn", lang), url=ch_url))
+        builder.row(InlineKeyboardButton(text=t("channel.check_btn", lang), callback_data="channel:check"))
 
-        await event.answer(
-            _JOIN_MSGS.get(lang, _JOIN_MSGS["en"]) + (f"\n\n<b>{ch_title}</b>" if ch_title else ""),
-            parse_mode="HTML",
-            reply_markup=builder.as_markup(),
-        )
-        # Don't call handler — stop processing
+        text = t("channel.join", lang) + (f"\n\n<b>{esc(ch_title)}</b>" if ch_title else "")
+        await target.answer(text, parse_mode="HTML", reply_markup=builder.as_markup())

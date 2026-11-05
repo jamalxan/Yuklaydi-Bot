@@ -3,8 +3,14 @@ from __future__ import annotations
 from typing import List
 from typing_extensions import Annotated
 
-from pydantic import field_validator
+import logging
+
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+
+CLOUD_API_MAX_MB = 50
+CLOUD_API_GETFILE_MAX_MB = 20  # getFile download limit on the cloud API
 
 
 class Settings(BaseSettings):
@@ -21,10 +27,11 @@ class Settings(BaseSettings):
     local_api_url: str = ""  # empty = use standard Telegram cloud API
 
     # Database
-    database_url: str = "postgresql+asyncpg://postgres:1@localhost:5432/vidbot"
+    database_url: str = "postgresql+asyncpg://bot:bot@localhost:5432/yuklaydi_bot"
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"
+    redis_password: str = ""  # optional; merged into redis_url (see redis_dsn)
     redis_max_connections: int = 512
 
     # DB pool (per process; route through PgBouncer when scaling out)
@@ -39,7 +46,12 @@ class Settings(BaseSettings):
     # Bot config
     admin_ids: Annotated[List[int], NoDecode] = []
     default_lang: str = "uz"
+    # Upload limit. The Telegram cloud Bot API caps bot uploads at 50 MB; only
+    # a Local Bot API server (LOCAL_API_URL) allows up to 2000 MB. The
+    # validator below clamps the value so a copied .env can't promise 2 GB on
+    # the cloud API (downloads would succeed and then fail on upload).
     max_file_mb: int = 50
+    max_audio_duration: int = 1200       # seconds; longer tracks are refused up-front
     download_dir: str = "./downloads"
     worker_concurrency: int = 5
     cookies_file: str = ""
@@ -51,12 +63,20 @@ class Settings(BaseSettings):
     # Rate limiting
     rate_limit_requests: int = 10
     rate_limit_window: int = 60
+    callback_rate_limit_requests: int = 30   # button presses per window
+    callback_debounce_seconds: int = 3       # identical (user, data) presses ignored
+
+    # Music search runs yt-dlp in the bot process; bound its thread pool so a
+    # search burst can't starve the event loop's default executor.
+    search_executor_workers: int = 4
+
+    # Statistics day boundary ("today" = local midnight in this zone)
+    stats_tz: str = "Asia/Tashkent"
 
     # Fairness / scale
     per_user_download_cap: int = 3       # max simultaneous fresh downloads per user
     yt_dlp_worker_concurrency: int = 4   # max concurrent yt-dlp calls per worker process
     job_timeout: int = 300               # arq job hard timeout (seconds)
-    single_flight_wait: int = 60         # max seconds a duplicate-URL job waits for cache
     max_queue_depth: int = 100_000       # reject new jobs above this depth (backpressure)
 
     # Logging
@@ -71,6 +91,17 @@ class Settings(BaseSettings):
             return [v]
         return v
 
+    @model_validator(mode="after")
+    def _clamp_cloud_limits(self):
+        if not self.local_api_url and self.max_file_mb > CLOUD_API_MAX_MB:
+            logging.getLogger("yuklaydi.config").warning(
+                "MAX_FILE_MB=%s ignored: cloud Bot API upload limit is %s MB "
+                "(set LOCAL_API_URL to use a Local Bot API server)",
+                self.max_file_mb, CLOUD_API_MAX_MB,
+            )
+            self.max_file_mb = CLOUD_API_MAX_MB
+        return self
+
     @property
     def max_file_bytes(self) -> int:
         return self.max_file_mb * 1024 * 1024
@@ -78,6 +109,26 @@ class Settings(BaseSettings):
     @property
     def use_local_api(self) -> bool:
         return bool(self.local_api_url)
+
+    @property
+    def redis_dsn(self) -> str:
+        """REDIS_URL with REDIS_PASSWORD injected when the URL carries none."""
+        return _with_redis_password(self.redis_url, self.redis_password)
+
+
+def _with_redis_password(url: str, password: str) -> str:
+    if not password:
+        return url
+    from urllib.parse import quote, urlsplit, urlunsplit
+    parts = urlsplit(url)
+    if parts.password:
+        return url
+    user = parts.username or ""
+    host = parts.hostname or "localhost"
+    netloc = f"{quote(user, safe='')}:{quote(password, safe='')}@{host}"
+    if parts.port:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 settings = Settings()

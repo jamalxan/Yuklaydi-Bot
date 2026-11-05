@@ -7,7 +7,7 @@ __pycache__/
 .pytest_cache/
 downloads/
 *.log
-alembic/versions/
+secrets/
 cookies.txt
 .idea/
 .coverage

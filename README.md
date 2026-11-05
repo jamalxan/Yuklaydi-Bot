@@ -94,7 +94,28 @@ Add to crontab (`crontab -e`):
 
 ## Instagram / Age-gated content
 
-Mount a `cookies.txt` (Netscape format) into the worker at `/downloads/cookies.txt`. yt-dlp will use it automatically.
+Put a `cookies.txt` (Netscape format) at `./secrets/cookies.txt`. Compose mounts
+`./secrets` read-only at `/app/secrets`, and yt-dlp picks it up automatically
+(`COOKIES_FILE` overrides the path). Do **not** keep it under `/downloads`: that
+volume is shared with the Bot API server, and the cleanup cron sweeps it.
+
+## Database migrations
+
+Alembic is the only schema tool. The bot runs `alembic upgrade head` itself on
+startup, and the migrations are idempotent. Manual run: `alembic upgrade head`.
+New change: `alembic revision -m "..."`, then write the migration by hand.
+
+## Production secrets
+
+`docker-compose.prod.yml` refuses to start unless `POSTGRES_PASSWORD` and
+`REDIS_PASSWORD` are set. The base file has no hard-coded passwords, and the
+Bot API port is bound to `127.0.0.1` only.
+
+## Temp-file cleanup
+
+Workers write temporary files only to `DOWNLOAD_DIR/tmp`. One arq cron job
+(`cleanup_task`, every 30 min, `unique=True`) deletes stale files there and
+never touches anything else.
 
 ---
 
@@ -111,10 +132,10 @@ docker compose up -d --scale worker=5
 
 ```bash
 # Install deps (requires ffmpeg installed locally)
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 
-# Run tests
-pytest
+# Run tests (offline; network tests are opt-in)
+pytest -m "not network"
 
 # Start the bot (requires .env with valid credentials)
 python -m bot.main

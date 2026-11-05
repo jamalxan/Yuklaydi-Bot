@@ -1,73 +1,26 @@
 from __future__ import annotations
 
 import html
+import logging
 
-from aiogram import Router
+from aiogram import F, Router
+from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
-from bot.db.repo import UserRepo, WelcomeRepo
+from bot.db.repo import SUPPORTED_LANGS, UserRepo, WelcomeRepo
 from bot.keyboards.inline import lang_keyboard
 from bot.services.cache import set_user_lang
+from bot.texts import DEFAULT_WELCOME, T, t
+
+logger = logging.getLogger("yuklaydi.start")
 
 router = Router()
+router.message.filter(F.chat.type == ChatType.PRIVATE)
 
-HELP_TEXTS = {
-    "uz": (
-        "ℹ️ <b>Yuklaydi Bot</b>\n\n"
-        "📥 <b>Video yuklash:</b>\n"
-        "YouTube, TikTok, Instagram, Facebook, Twitter/X va boshqa saytlardan havola yuboring.\n\n"
-        "🎵 <b>Qo'shiq topish:</b>\n"
-        "Ovozli xabar, video yoki audio faylni yuboring — qo'shiq aniqlanadi.\n\n"
-        "🔍 <b>Musiqa qidirish:</b>\n"
-        "Qo'shiq nomini yozing — MP3 yuboramiz.\n\n"
-        "<i>⚠️ Kontent shaxsiy foydalanish uchun. Platforma shartlariga rioya qiling.</i>"
-    ),
-    "ru": (
-        "ℹ️ <b>Yuklaydi Bot</b>\n\n"
-        "📥 <b>Скачать видео:</b>\n"
-        "Отправьте ссылку на YouTube, TikTok, Instagram, Facebook, Twitter/X и другие.\n\n"
-        "🎵 <b>Найти песню:</b>\n"
-        "Отправьте голосовое, видео или аудио — определим песню.\n\n"
-        "🔍 <b>Поиск музыки:</b>\n"
-        "Напишите название песни — пришлём MP3.\n\n"
-        "<i>⚠️ Контент для личного использования. Соблюдайте условия платформ.</i>"
-    ),
-    "en": (
-        "ℹ️ <b>Yuklaydi Bot</b>\n\n"
-        "📥 <b>Download Video:</b>\n"
-        "Send a link from YouTube, TikTok, Instagram, Facebook, Twitter/X and more.\n\n"
-        "🎵 <b>Find Song:</b>\n"
-        "Send a voice message, video, or audio — we'll identify the song.\n\n"
-        "🔍 <b>Music Search:</b>\n"
-        "Type a song name — we'll send the MP3.\n\n"
-        "<i>⚠️ Content is for personal use. Respect platform terms of service.</i>"
-    ),
-}
-
-_DEFAULT_WELCOME = {
-    "uz": (
-        "👋 Salom, <b>{first_name}</b>!\n\n"
-        "🎬 Havola yuboring — video yuklab beraman.\n"
-        "🎵 Qo'shiq nomi yozing — MP3 yuboraman.\n"
-        "🎤 Ovozli xabar yuboring — qo'shiqni topib beraman.\n\n"
-        "<i>🤖 @vidyuklaydi_bot</i>"
-    ),
-    "ru": (
-        "👋 Привет, <b>{first_name}</b>!\n\n"
-        "🎬 Отправьте ссылку — скачаю видео.\n"
-        "🎵 Напишите название песни — пришлю MP3.\n"
-        "🎤 Отправьте голосовое — найду песню.\n\n"
-        "<i>🤖 @vidyuklaydi_bot</i>"
-    ),
-    "en": (
-        "👋 Hello, <b>{first_name}</b>!\n\n"
-        "🎬 Send a link — I'll download the video.\n"
-        "🎵 Type a song name — I'll send the MP3.\n"
-        "🎤 Send a voice message — I'll find the song.\n\n"
-        "<i>🤖 @vidyuklaydi_bot</i>"
-    ),
-}
+HELP_TEXTS = T["help"]
+_DEFAULT_WELCOME = DEFAULT_WELCOME
 
 
 def _render(template: str, first_name: str, username: str) -> str:
@@ -90,29 +43,38 @@ async def _get_welcome(lang: str) -> str:
     return _DEFAULT_WELCOME.get(lang, _DEFAULT_WELCOME["en"])
 
 
+async def send_welcome(message: Message, lang: str, first_name: str, username: str) -> None:
+    """Send the (admin-editable) welcome; fall back to the default if it is broken.
+
+    A custom welcome with invalid HTML would otherwise make /start fail for
+    every single user.
+    """
+    template = await _get_welcome(lang)
+    try:
+        await message.answer(_render(template, first_name, username), parse_mode="HTML")
+    except TelegramBadRequest as e:
+        logger.error(f"Custom welcome for '{lang}' is invalid, using default: {e}")
+        default = _DEFAULT_WELCOME.get(lang, _DEFAULT_WELCOME["en"])
+        await message.answer(_render(default, first_name, username), parse_mode="HTML")
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message, user_repo: UserRepo, user_lang: str):
     user = await user_repo.get(message.from_user.id)
-    if user is None:
-        await message.answer(
-            "👋 Assalomu alaykum! / Добро пожаловать! / Welcome!\n\nPlease choose your language:",
-            reply_markup=lang_keyboard(),
-        )
-    else:
-        lang = user.lang
-        template = await _get_welcome(lang)
-        text = _render(template, message.from_user.first_name or "", message.from_user.username or "")
-        await message.answer(text, parse_mode="HTML")
+    if user is None or not user.lang_chosen:
+        await message.answer(t("start.choose_lang", user_lang), reply_markup=lang_keyboard())
+        return
+    await send_welcome(message, user.lang, message.from_user.first_name or "", message.from_user.username or "")
 
 
-@router.callback_query(lambda c: c.data and c.data.startswith("lang:"))
+@router.callback_query(F.data.startswith("lang:"))
 async def cb_lang_select(callback: CallbackQuery, user_repo: UserRepo):
-    lang = callback.data.split(":")[1]
-    if lang not in ("uz", "ru", "en"):
+    lang = callback.data.split(":", 1)[1]
+    if lang not in SUPPORTED_LANGS:
         await callback.answer()
         return
 
-    await user_repo.get_or_create(
+    await user_repo.upsert_seen(
         callback.from_user.id,
         username=callback.from_user.username,
         first_name=callback.from_user.first_name,
@@ -121,21 +83,21 @@ async def cb_lang_select(callback: CallbackQuery, user_repo: UserRepo):
     await user_repo.set_lang(callback.from_user.id, lang)
     await set_user_lang(callback.from_user.id, lang)
 
-    saved = {"uz": "✅ Til saqlandi!", "ru": "✅ Язык сохранён!", "en": "✅ Language saved!"}
-    await callback.message.edit_text(saved.get(lang, "✅ Saved!"))
-
-    template = await _get_welcome(lang)
-    text = _render(template, callback.from_user.first_name or "", callback.from_user.username or "")
-    await callback.message.answer(text, parse_mode="HTML")
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_text(t("start.lang_saved", lang))
+        except TelegramBadRequest:
+            pass
+        await send_welcome(callback.message, lang,
+                           callback.from_user.first_name or "", callback.from_user.username or "")
     await callback.answer()
 
 
 @router.message(Command("lang"))
 async def cmd_lang(message: Message, user_lang: str):
-    prompts = {"uz": "🌐 Tilni tanlang:", "ru": "🌐 Выберите язык:", "en": "🌐 Select language:"}
-    await message.answer(prompts.get(user_lang, "🌐 Select language:"), reply_markup=lang_keyboard())
+    await message.answer(t("start.lang_prompt", user_lang), reply_markup=lang_keyboard())
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message, user_lang: str):
-    await message.answer(HELP_TEXTS.get(user_lang, HELP_TEXTS["en"]), parse_mode="HTML")
+    await message.answer(t("help", user_lang), parse_mode="HTML")

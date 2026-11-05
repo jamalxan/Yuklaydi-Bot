@@ -5,18 +5,21 @@ from typing import Optional
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from bot.services.music_search import SongEntry, format_duration
+from bot.services.music_search import LONG_TRACK_SECONDS, SongEntry, format_duration
+from bot.texts import T, t
+from bot.utils.text import esc
 
 LANG_FLAGS = {"uz": "🇺🇿 O'zbek", "ru": "🇷🇺 Русский", "en": "🇬🇧 English"}
 
-LISTEN_LABELS = {"uz": "🎧 Tinglash", "ru": "🎧 Слушать", "en": "🎧 Listen"}
-LYRICS_LABELS = {"uz": "📝 Qo'shiq matni", "ru": "📝 Текст песни", "en": "📝 Lyrics"}
-FIND_SONG_LABELS = {"uz": "🎵 Qo'shiqni top", "ru": "🎵 Найти песню", "en": "🎵 Find song"}
-MP3_LABELS = {"uz": "🎧 Audio sifatida olish", "ru": "🎧 Получить аудио", "en": "🎧 Get as audio"}
-HD_LABELS = {"uz": "🎬 1080p", "ru": "🎬 1080p", "en": "🎬 1080p"}
-DL_SONG_LABELS = {"uz": "⬇️ MP3 yuklab olish", "ru": "⬇️ Скачать MP3", "en": "⬇️ Download MP3"}
-RETRY_LABELS = {"uz": "🔁 Qayta", "ru": "🔁 Повторить", "en": "🔁 Retry"}
-SUBSCRIBED_LABELS = {"uz": "✅ Obuna bo'ldim", "ru": "✅ Я подписался", "en": "✅ I subscribed"}
+# Label dicts (views into bot.texts.T — the single source of strings)
+LISTEN_LABELS = T["btn.listen"]
+LYRICS_LABELS = T["btn.lyrics"]
+FIND_SONG_LABELS = T["btn.find_song"]
+MP3_LABELS = T["btn.mp3"]
+HD_LABELS = T["btn.hd"]
+DL_SONG_LABELS = T["btn.dl_song"]
+RETRY_LABELS = T["btn.retry"]
+SUBSCRIBED_LABELS = T["channel.check_btn"]
 
 
 def lang_keyboard() -> InlineKeyboardMarkup:
@@ -32,8 +35,8 @@ def lang_keyboard() -> InlineKeyboardMarkup:
 def video_result_keyboard(url_key: str, shazam_key: str, lang: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(text=FIND_SONG_LABELS.get(lang, "🎵 Find song"), callback_data=f"vshz:{shazam_key}"),
-        InlineKeyboardButton(text=MP3_LABELS.get(lang, "🎧 MP3"), callback_data=f"vdalt:mp3:{url_key}"),
+        InlineKeyboardButton(text=t("btn.find_song", lang), callback_data=f"vshz:{shazam_key}"),
+        InlineKeyboardButton(text=t("btn.mp3", lang), callback_data=f"vdalt:mp3:{url_key}"),
     )
     return builder.as_markup()
 
@@ -59,16 +62,16 @@ def song_card_keyboard(
     # callback_data uses 12-char hash key (≤21 bytes total, well under 64-byte limit)
     if has_lyrics:
         builder.row(InlineKeyboardButton(
-            text=LYRICS_LABELS.get(lang, "📝 Lyrics"),
+            text=t("btn.lyrics", lang),
             callback_data=f"lyrics:0:{song_key}",
         ))
     if show_download:
         builder.row(InlineKeyboardButton(
-            text=DL_SONG_LABELS.get(lang, "⬇️ Download MP3"),
+            text=t("btn.dl_song", lang),
             callback_data=f"dlsong:{song_key}",
         ))
     builder.row(InlineKeyboardButton(
-        text=RETRY_LABELS.get(lang, "🔁 Retry"),
+        text=t("btn.retry", lang),
         callback_data="shazam:retry",
     ))
     return builder.as_markup()
@@ -101,7 +104,9 @@ def music_search_keyboard(
     for i, entry in enumerate(page_entries, start=1):
         num = start + i
         dur = format_duration(entry.duration)
-        lines.append(f"{num}. <b>{entry.uploader}</b> — {entry.title}  <code>{dur}</code>")
+        long_mark = f" {t('btn.long', lang)}" if entry.duration > LONG_TRACK_SECONDS else ""
+        # YouTube titles/uploaders are attacker-controlled: escape before HTML
+        lines.append(f"{num}. <b>{esc(entry.uploader)}</b> — {esc(entry.title)}  <code>{dur}</code>{long_mark}")
 
     text = "\n".join(lines)
 
@@ -133,19 +138,8 @@ def music_search_keyboard(
 def audio_result_keyboard(song_key: str, lang: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(
-        text=LYRICS_LABELS.get(lang, "📝 Lyrics"),
+        text=t("btn.lyrics", lang),
         callback_data=f"lyrics:0:{song_key}",
-    ))
-    return builder.as_markup()
-
-
-def channel_join_keyboard(channel_url: str, lang: str) -> InlineKeyboardMarkup:
-    join_labels = {"uz": "📢 Kanalga o'tish", "ru": "📢 Перейти в канал", "en": "📢 Join channel"}
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text=join_labels.get(lang, "📢 Join"), url=channel_url))
-    builder.row(InlineKeyboardButton(
-        text=SUBSCRIBED_LABELS.get(lang, "✅ I subscribed"),
-        callback_data="channel:check",
     ))
     return builder.as_markup()
 

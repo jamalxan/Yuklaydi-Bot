@@ -10,24 +10,19 @@ import pytest
 
 from bot.handlers.download import extract_url
 from bot.handlers.music import _URL_RE, _HANDLED_TYPES
-from bot.keyboards.reply import get_menu_action
 from bot.services.music_search import clean_title, format_duration
 
 
 # ── No reply keyboard anywhere ────────────────────────────────────────────────
 
-def test_no_reply_keyboard_in_reply_module():
-    """reply.py must not define main_menu or any ReplyKeyboardMarkup factory."""
-    import bot.keyboards.reply as reply_mod
-    assert not hasattr(reply_mod, "main_menu"), "main_menu must be removed"
-    assert not hasattr(reply_mod, "ReplyKeyboardMarkup")
+def test_legacy_reply_module_and_ftl_locales_removed():
+    """BUG-30: dead reply keyboard module and unused .ftl locales are gone."""
+    import importlib.util
+    import pathlib
 
-
-def test_reply_module_get_menu_action_returns_none():
-    """get_menu_action stub must always return None."""
-    assert get_menu_action("📥 Video yuklash") is None
-    assert get_menu_action("🎵 Найти песню") is None
-    assert get_menu_action("anything") is None
+    assert importlib.util.find_spec("bot.keyboards.reply") is None
+    root = pathlib.Path(__file__).parent.parent
+    assert not list((root / "bot" / "locales").glob("*.ftl"))
 
 
 def test_no_reply_keyboard_imported_in_handlers():

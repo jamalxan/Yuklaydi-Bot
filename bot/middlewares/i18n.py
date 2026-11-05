@@ -1,12 +1,39 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from aiogram import BaseMiddleware
-from aiogram.types import TelegramObject, Update
+from aiogram.types import TelegramObject, User
 
 from bot.config import settings
-from bot.services.cache import get_user_lang
+from bot.services.cache import get_user_lang, set_user_lang
+
+logger = logging.getLogger("yuklaydi.i18n")
+
+
+async def resolve_lang(user_id: Optional[int], user_repo=None) -> str:
+    """Redis → DB → default. Never raises; a DB hit re-fills the Redis cache."""
+    if not user_id:
+        return settings.default_lang
+    try:
+        cached = await get_user_lang(user_id)
+        if cached:
+            return cached
+    except Exception as e:
+        logger.warning(f"Lang cache read failed: {e}")
+    if user_repo is not None:
+        try:
+            user = await user_repo.get(user_id)
+            if user and user.lang:
+                try:
+                    await set_user_lang(user_id, user.lang)
+                except Exception:
+                    pass
+                return user.lang
+        except Exception as e:
+            logger.warning(f"Lang DB read failed: {e}")
+    return settings.default_lang
 
 
 class UserLangMiddleware(BaseMiddleware):
@@ -18,30 +45,6 @@ class UserLangMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: Dict[str, Any],
     ) -> Any:
-        user_id: Optional[int] = None
-
-        if isinstance(event, Update):
-            for attr in ("message", "callback_query", "inline_query"):
-                obj = getattr(event, attr, None)
-                if obj and obj.from_user:
-                    user_id = obj.from_user.id
-                    break
-        else:
-            from_user = getattr(event, "from_user", None)
-            if from_user:
-                user_id = from_user.id
-
-        lang = settings.default_lang
-        if user_id:
-            cached = await get_user_lang(user_id)
-            if cached:
-                lang = cached
-            else:
-                user_repo = data.get("user_repo")
-                if user_repo:
-                    user = await user_repo.get(user_id)
-                    if user:
-                        lang = user.lang
-
-        data["user_lang"] = lang
+        user: Optional[User] = data.get("event_from_user") or getattr(event, "from_user", None)
+        data["user_lang"] = await resolve_lang(user.id if user else None, data.get("user_repo"))
         return await handler(event, data)

@@ -77,10 +77,45 @@ async def _try_recognize_snippet(media_path: str, snippet_path: str,
     return parsed
 
 
-async def recognize(media_path: str) -> Optional[SongResult]:
-    """Recognize song using multi-window Shazam search.
+SHORT_CLIP_SECONDS = 15
 
-    Strategy: middle 15s → start 15s → full 30s.
+
+def recognition_windows(total_dur: float) -> list[tuple[float, int]]:
+    """Distinct (start, duration) windows to try, best first.
+
+    middle 15 s → first 15 s → middle 30 s. On short clips these collapse to
+    the same audio, which used to be sent to Shazam three times (six with
+    retries); duplicates are removed and clips ≤ 15 s get a single attempt.
+    ``start = -1`` means "centre the window" (resolved by extract_audio_snippet).
+    """
+    if total_dur <= 0:
+        # Unknown duration (probe failed): keep the classic strategy.
+        return [(-1.0, 15), (0.0, 15), (0.0, 30)]
+    if total_dur <= SHORT_CLIP_SECONDS:
+        return [(0.0, max(1, int(total_dur)))]
+
+    def window(start: float, dur: int) -> tuple[float, int]:
+        dur = min(dur, int(total_dur))
+        start = max(0.0, min(start, total_dur - dur))
+        return round(start, 1), dur
+
+    candidates = [
+        window(total_dur / 2 - 7.5, 15),
+        window(0.0, 15),
+        window(total_dur / 2 - 15, 30),
+    ]
+    seen: set[tuple[float, int]] = set()
+    unique: list[tuple[float, int]] = []
+    for w in candidates:
+        if w not in seen:
+            seen.add(w)
+            unique.append(w)
+    return unique
+
+
+async def recognize(media_path: str) -> Optional[SongResult]:
+    """Recognize song using multi-window Shazam search (see recognition_windows).
+
     Handles OGG/Opus voice notes, short clips, and large video files.
     """
     snippet_path = get_temp_path(suffix=".wav", prefix="shz_")
@@ -88,21 +123,10 @@ async def recognize(media_path: str) -> Optional[SongResult]:
         total_dur = await probe_duration(media_path)
         logger.info(f"Recognizing: {media_path} (duration={total_dur:.1f}s)")
 
-        # Window 1: middle of the file (best for song identification)
-        result = await _try_recognize_snippet(media_path, snippet_path, start=-1.0, duration=15)
-        if result:
-            return result
-
-        # Window 2: from the very beginning (catches intros)
-        result = await _try_recognize_snippet(media_path, snippet_path, start=0.0, duration=15)
-        if result:
-            return result
-
-        # Window 3: 30-second window from middle (more context for Shazam)
-        mid_start = max(0.0, (total_dur / 2) - 15) if total_dur > 30 else 0.0
-        result = await _try_recognize_snippet(media_path, snippet_path, start=mid_start, duration=30)
-        if result:
-            return result
+        for start, duration in recognition_windows(total_dur):
+            result = await _try_recognize_snippet(media_path, snippet_path, start=start, duration=duration)
+            if result:
+                return result
 
         logger.info(f"Shazam: no match found for {media_path}")
         return None

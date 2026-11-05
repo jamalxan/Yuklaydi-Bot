@@ -1,48 +1,57 @@
-version: "3.9"
-
-# Production overrides — use with: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# Production overrides:
+#   POSTGRES_PASSWORD=... REDIS_PASSWORD=... \
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Passwords are REQUIRED here (compose aborts if unset). The base file already
+# wires the same variables into pgbouncer, DATABASE_URL and REDIS_URL, so
+# every service uses one value — no hard-coded "bot_password" anywhere.
+# Log rotation and the Redis maxmemory policy are defined once in the base.
 
 services:
   telegram-bot-api:
     restart: always
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "5"
 
   postgres:
     restart: always
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-bot}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?DB password required}
-      POSTGRES_DB: ${POSTGRES_DB:-yuklaydi_bot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in production}
+
+  pgbouncer:
+    restart: always
+    environment:
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in production}
 
   redis:
     restart: always
-    command: >
-      sh -c 'if [ -n "$$REDIS_PASSWORD" ]; then
-        exec redis-server --save 60 1 --requirepass "$$REDIS_PASSWORD";
-      else
-        exec redis-server --save 60 1;
-      fi'
     environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required in production}
 
   bot:
     restart: always
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "5"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://bot:${POSTGRES_PASSWORD:?}@pgbouncer:5432/yuklaydi_bot
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
 
   worker:
     restart: always
+    environment:
+      DATABASE_URL: postgresql+asyncpg://bot:${POSTGRES_PASSWORD:?}@pgbouncer:5432/yuklaydi_bot
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
     deploy:
       replicas: 3
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "5"
+
+  worker-recognition:
+    restart: always
+    environment:
+      DATABASE_URL: postgresql+asyncpg://bot:${POSTGRES_PASSWORD:?}@pgbouncer:5432/yuklaydi_bot
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+    deploy:
+      replicas: 1
+
+  worker-music:
+    restart: always
+    environment:
+      DATABASE_URL: postgresql+asyncpg://bot:${POSTGRES_PASSWORD:?}@pgbouncer:5432/yuklaydi_bot
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+    deploy:
+      replicas: 1

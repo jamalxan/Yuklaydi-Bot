@@ -295,14 +295,15 @@ async def test_download_for_recognize_falls_back_to_yt_dlp():
         temp_path = tf.name
     os.unlink(temp_path)
 
-    m4a_path = temp_path.replace(".mp4", ".m4a")
+    produced_paths = []
 
-    def _fake_download_sync_fn(url, path, quality):
-        with open(m4a_path, "wb") as f:
+    def _fake_clip_sync(url, output_path):
+        with open(output_path, "wb") as f:
             f.write(b"\xff" * 2000)
-        return DownloadResult(m4a_path, 0.1, 0.5, 2000)
+        produced_paths.append(output_path)
+        return output_path
 
-    with patch("bot.services.downloader._download_sync", side_effect=_fake_download_sync_fn):
+    with patch("bot.services.downloader._download_audio_clip_sync", side_effect=_fake_clip_sync):
         result = await _download_for_recognize(
             bot, "fid_abc", ".mp4", temp_path, source_url="https://youtube.com/watch?v=abc"
         )
@@ -313,5 +314,4 @@ async def test_download_for_recognize_falls_back_to_yt_dlp():
     assert result is True
     if os.path.exists(temp_path):
         os.unlink(temp_path)
-    if os.path.exists(m4a_path):
-        os.unlink(m4a_path)
+    assert produced_paths and produced_paths[0].endswith("_clip.m4a")

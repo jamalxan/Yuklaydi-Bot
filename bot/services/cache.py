@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 from typing import Optional
 
 import redis.asyncio as aioredis
@@ -23,7 +24,7 @@ async def get_redis() -> aioredis.Redis:
     global _redis
     if _redis is None:
         _redis = aioredis.from_url(
-            settings.redis_url,
+            settings.redis_dsn,
             decode_responses=True,
             # Fail fast instead of hanging the event loop when Redis stalls
             socket_connect_timeout=5,
@@ -126,9 +127,7 @@ async def get_music_search_by_hash(qhash: str) -> Optional[list]:
 
 async def store_video_for_shazam(file_id: str, file_suffix: str = ".mp4",
                                  source_url: str = "") -> str:
-    import hashlib
-    import time
-    key = hashlib.md5(f"{file_id}{time.time()}".encode()).hexdigest()[:10]
+    key = secrets.token_hex(5)  # 10 hex chars, unguessable, fits callback_data
     r = await get_redis()
     payload: dict = {"fid": file_id, "suf": file_suffix}
     if source_url:
@@ -182,7 +181,9 @@ async def invalidate_setting(key: str) -> None:
 
 # ── Per-user concurrency slot (prevents one user starving workers) ─────────────
 
-_SLOT_TTL = 300  # auto-expire in 5 min if worker crashes
+# Auto-expire if a worker dies mid-job. Must outlive the longest job, or the
+# counter vanishes while a download is still running and the cap leaks.
+_SLOT_TTL = settings.job_timeout + 60
 
 
 async def get_active_downloads(user_id: int) -> int:
@@ -197,6 +198,32 @@ async def acquire_user_slot(user_id: int) -> None:
     await pipe.incr(f"ucap:{user_id}")
     await pipe.expire(f"ucap:{user_id}", _SLOT_TTL)
     await pipe.execute()
+
+
+# Atomic "reserve a slot if under the cap" — called at ENQUEUE time so jobs
+# still waiting in the queue count against the user's cap.
+_TRY_ACQUIRE_SLOT_LUA = """
+local v = tonumber(redis.call('GET', KEYS[1]) or '0')
+if v >= tonumber(ARGV[1]) then return 0 end
+redis.call('INCR', KEYS[1])
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+return 1
+"""
+
+
+async def try_acquire_user_slot(user_id: int, cap: int) -> bool:
+    """Reserve one download slot; False if the user already has *cap* active."""
+    r = await get_redis()
+    key = f"ucap:{user_id}"
+    try:
+        return bool(await r.eval(_TRY_ACQUIRE_SLOT_LUA, 1, key, cap, _SLOT_TTL))
+    except Exception:
+        # Fallback for Redis builds without EVAL (tests/mocks): non-atomic
+        v = await r.get(key)
+        if v and int(v) >= cap:
+            return False
+        await acquire_user_slot(user_id)
+        return True
 
 
 # Atomic floor-at-zero decrement — a GET/DECR pair races under concurrency
@@ -229,6 +256,12 @@ async def acquire_single_flight(url: str, quality: str, ttl: int = 120) -> bool:
     r = await get_redis()
     ok = await r.set(f"sf:{h}", "1", nx=True, ex=ttl)
     return bool(ok)
+
+
+async def single_flight_held(url: str, quality: str) -> bool:
+    """True while another worker holds the download lock for url+quality."""
+    h = hashlib.sha256(f"{url}|{quality}".encode()).hexdigest()
+    return bool(await (await get_redis()).exists(f"sf:{h}"))
 
 
 async def release_single_flight(url: str, quality: str) -> None:
@@ -282,6 +315,83 @@ async def set_cached_membership(user_id: int, is_member: bool) -> None:
 
 async def invalidate_membership(user_id: int) -> None:
     await (await get_redis()).delete(f"chmem:{user_id}")
+
+
+# ── Ban list (checked on every update — must be O(1), no DB hit) ─────────────
+
+_BAN_SET = "banned_users"
+
+
+async def is_banned(user_id: int) -> bool:
+    return bool(await (await get_redis()).sismember(_BAN_SET, str(user_id)))
+
+
+async def set_banned(user_id: int, banned: bool) -> None:
+    r = await get_redis()
+    if banned:
+        await r.sadd(_BAN_SET, str(user_id))
+    else:
+        await r.srem(_BAN_SET, str(user_id))
+
+
+async def load_banned(user_ids: list[int]) -> None:
+    """Replace the Redis ban set with the DB truth (called at startup)."""
+    r = await get_redis()
+    pipe = r.pipeline()
+    await pipe.delete(_BAN_SET)
+    if user_ids:
+        await pipe.sadd(_BAN_SET, *[str(u) for u in user_ids])
+    await pipe.execute()
+
+
+# ── "User seen" marker (throttles the per-update DB upsert) ──────────────────
+
+USER_SEEN_TTL = 60 * 60  # upsert a user's profile at most once per hour
+
+
+async def mark_user_seen(user_id: int) -> bool:
+    """True if this is the first sighting within USER_SEEN_TTL (caller upserts)."""
+    ok = await (await get_redis()).set(f"useen:{user_id}", "1", nx=True, ex=USER_SEEN_TTL)
+    return bool(ok)
+
+
+async def forget_user_seen(user_id: int) -> None:
+    await (await get_redis()).delete(f"useen:{user_id}")
+
+
+# ── Callback throttling ──────────────────────────────────────────────────────
+
+async def check_callback_rate(user_id: int, data: str) -> tuple[bool, str]:
+    """Return (allowed, reason). reason is "debounce" or "rate" when blocked.
+
+    Identical (user, callback_data) presses within callback_debounce_seconds
+    are dropped; on top of that a softer per-user window limit applies.
+    """
+    r = await get_redis()
+    dkey = "cbd:" + hashlib.sha256(f"{user_id}|{data}".encode()).hexdigest()[:24]
+    if not await r.set(dkey, "1", nx=True, ex=max(1, settings.callback_debounce_seconds)):
+        return False, "debounce"
+    key = f"rlc:{user_id}"
+    count = await r.incr(key)
+    if count == 1:
+        await r.expire(key, settings.rate_limit_window)
+    if count > settings.callback_rate_limit_requests:
+        return False, "rate"
+    return True, ""
+
+
+# ── Broadcast lock / progress ─────────────────────────────────────────────────
+
+BROADCAST_LOCK = "broadcast:lock"
+BROADCAST_STATE = "broadcast:state"
+
+
+async def acquire_broadcast_lock(owner: str, ttl: int = 6 * 3600) -> bool:
+    return bool(await (await get_redis()).set(BROADCAST_LOCK, owner, nx=True, ex=ttl))
+
+
+async def release_broadcast_lock() -> None:
+    await (await get_redis()).delete(BROADCAST_LOCK)
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

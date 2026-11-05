@@ -1,49 +1,27 @@
-"""Safe, idempotent DB migrations run at startup before create_all."""
+"""Database bootstrap: Alembic is the only schema tool; this module runs it.
+
+Startup calls :func:`upgrade_database`, which
+1. waits (bounded) for the database to accept connections,
+2. runs ``alembic upgrade head`` in a worker thread (Alembic's env.py uses
+   ``asyncio.run`` and can't share the bot's event loop),
+3. seeds default rows (idempotent ``ON CONFLICT DO NOTHING``).
+
+Any failure raises — the caller must not start the bot on a broken schema.
+"""
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from bot.texts import DEFAULT_WELCOME
+
 logger = logging.getLogger("yuklaydi.migrations")
 
-_ALTER_STMTS = [
-    # users — new columns
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(128)",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name VARCHAR(256)",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active TIMESTAMPTZ",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS recognitions_count INTEGER DEFAULT 0",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS searches_count INTEGER DEFAULT 0",
-    # downloads — new column
-    "ALTER TABLE downloads ADD COLUMN IF NOT EXISTS from_cache BOOLEAN DEFAULT FALSE",
-    # daily_stats — new columns
-    "ALTER TABLE daily_stats ADD COLUMN IF NOT EXISTS searches INTEGER DEFAULT 0",
-    "ALTER TABLE daily_stats ADD COLUMN IF NOT EXISTS audio_sent INTEGER DEFAULT 0",
-    "ALTER TABLE daily_stats ADD COLUMN IF NOT EXISTS cache_hits INTEGER DEFAULT 0",
-]
-
-_DEFAULT_WELCOME = {
-    "uz": (
-        "👋 Salom, <b>{first_name}</b>!\n\n"
-        "🎬 Video yuklash uchun havola yuboring.\n"
-        "🎵 Qo'shiq topish uchun musiqa nomi yoki ovozli xabar yuboring.\n\n"
-        "<i>🤖 @vidyuklaydi_bot</i>"
-    ),
-    "ru": (
-        "👋 Привет, <b>{first_name}</b>!\n\n"
-        "🎬 Отправьте ссылку для скачивания видео.\n"
-        "🎵 Отправьте название песни или голосовое сообщение для поиска.\n\n"
-        "<i>🤖 @vidyuklaydi_bot</i>"
-    ),
-    "en": (
-        "👋 Hello, <b>{first_name}</b>!\n\n"
-        "🎬 Send a link to download a video.\n"
-        "🎵 Send a song name or voice message to find music.\n\n"
-        "<i>🤖 @vidyuklaydi_bot</i>"
-    ),
-}
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 _DEFAULT_SETTINGS = {
     "required_channel_id": "",
@@ -52,32 +30,51 @@ _DEFAULT_SETTINGS = {
 }
 
 
-async def run_migrations(engine: AsyncEngine) -> None:
-    async with engine.begin() as conn:
-        for stmt in _ALTER_STMTS:
-            try:
-                await conn.execute(text(stmt))
-            except Exception as e:
-                logger.debug(f"Migration skipped ({stmt[:40]}...): {e}")
+def _alembic_upgrade_head() -> None:
+    from alembic import command
+    from alembic.config import Config
 
-        # Seed welcome messages
-        for lang, txt in _DEFAULT_WELCOME.items():
+    cfg = Config(os.path.join(_PROJECT_ROOT, "alembic.ini"))
+    cfg.set_main_option("script_location", os.path.join(_PROJECT_ROOT, "alembic"))
+    cfg.attributes["configure_logger"] = False  # keep the app's JSON logging
+    command.upgrade(cfg, "head")
+
+
+async def wait_for_db(engine: AsyncEngine, attempts: int = 10, delay: float = 3.0) -> None:
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            return
+        except Exception as e:  # connection refused, DNS, auth …
+            last = e
+            logger.warning(f"Database not ready (attempt {attempt}/{attempts}): {e}")
+            await asyncio.sleep(delay)
+    raise RuntimeError(f"Database unavailable after {attempts} attempts: {last}")
+
+
+async def seed_defaults(engine: AsyncEngine) -> None:
+    async with engine.begin() as conn:
+        for lang, txt in DEFAULT_WELCOME.items():
             await conn.execute(
-                text(
-                    "INSERT INTO welcome_messages (lang, text) VALUES (:lang, :text) "
-                    "ON CONFLICT (lang) DO NOTHING"
-                ),
+                text("INSERT INTO welcome_messages (lang, text) VALUES (:lang, :text) "
+                     "ON CONFLICT (lang) DO NOTHING"),
                 {"lang": lang, "text": txt},
             )
-
-        # Seed default settings
         for key, value in _DEFAULT_SETTINGS.items():
             await conn.execute(
-                text(
-                    "INSERT INTO settings (key, value) VALUES (:key, :value) "
-                    "ON CONFLICT (key) DO NOTHING"
-                ),
+                text("INSERT INTO settings (key, value) VALUES (:key, :value) "
+                     "ON CONFLICT (key) DO NOTHING"),
                 {"key": key, "value": value},
             )
 
-    logger.info("DB migrations complete")
+
+async def upgrade_database(engine: AsyncEngine | None = None) -> None:
+    if engine is None:
+        from bot.db.session import engine as default_engine
+        engine = default_engine
+    await wait_for_db(engine)
+    await asyncio.to_thread(_alembic_upgrade_head)
+    await seed_defaults(engine)
+    logger.info("DB migrations complete (alembic head)")
