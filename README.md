@@ -99,6 +99,16 @@ Put a `cookies.txt` (Netscape format) at `./secrets/cookies.txt`. Compose mounts
 (`COOKIES_FILE` overrides the path). Do **not** keep it under `/downloads`: that
 volume is shared with the Bot API server, and the cleanup cron sweeps it.
 
+## Blocked platforms (TikTok) — proxy
+
+Some networks block TikTok (TLS handshakes to `www.tiktok.com` time out and the
+`v16/v19-webapp-prime` video CDNs never connect). Set `PROXY_URL` to an HTTP or
+SOCKS5 proxy outside that network (`socks5://host:1080`,
+`http://user:pass@host:3128`); `PROXY_PLATFORMS` (default `tiktok`) lists the
+platforms that go through it, everything else stays direct. yt-dlp passes the
+proxy to aria2c as well. The TikTok extractor also needs `curl_cffi` (in
+requirements) for TLS impersonation.
+
 ## Database migrations
 
 Alembic is the only schema tool. The bot runs `alembic upgrade head` itself on

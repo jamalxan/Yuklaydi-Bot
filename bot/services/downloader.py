@@ -253,6 +253,25 @@ def cookies_path() -> Optional[str]:
     return None
 
 
+def proxy_for(url: str) -> Optional[str]:
+    """PROXY_URL if *url*'s platform is listed in PROXY_PLATFORMS, else None."""
+    proxy = settings.proxy_url.strip()
+    if not proxy:
+        return None
+    wanted = {p.strip().lower() for p in settings.proxy_platforms.split(",") if p.strip()}
+    if "all" in wanted:
+        return proxy
+    platform = platform_for_host(safe_hostname(url) or "")
+    return proxy if platform in wanted else None
+
+
+def apply_proxy(opts: dict, url: str) -> None:
+    """Route this yt-dlp run through the configured proxy when the platform asks for it."""
+    proxy = proxy_for(url)
+    if proxy:
+        opts["proxy"] = proxy  # yt-dlp also hands it to aria2c (--all-proxy)
+
+
 def has_cookies() -> bool:
     """True if any cookie source is configured (file or browser profile)."""
     return bool(cookies_path() or settings.cookies_from_browser)
@@ -662,6 +681,7 @@ def run_ydl(url: str, opts: dict, quality: Optional[str] = None) -> tuple[dict, 
     Returns (info, t_extract, t_download); raises DownloadError.
     """
     attempts = [dict(opts)]  # copy: _pick_downloader edits the dict yt-dlp holds
+    apply_proxy(attempts[0], url)
     if platform_for_host(safe_hostname(url) or "") == "youtube":
         for clients in YOUTUBE_FALLBACK_CLIENT_SETS:
             fallback = dict(opts)

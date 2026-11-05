@@ -70,6 +70,13 @@ class Settings(BaseSettings):
     # the browser profile. Needed for Instagram (login-gated since 2024+) and
     # helps YouTube dodge bot-checks. Empty = disabled.
     cookies_from_browser: str = ""
+    # Outbound proxy for yt-dlp (http://, https:// or socks5://host:port,
+    # credentials allowed). Applied only to the platforms listed in
+    # PROXY_PLATFORMS (comma-separated, or "all"). Default routes TikTok,
+    # which is blocked at ISP level in some countries, while YouTube and
+    # Instagram keep going direct. Empty = no proxy anywhere.
+    proxy_url: str = ""
+    proxy_platforms: str = "tiktok"
 
     # Rate limiting
     rate_limit_requests: int = 10

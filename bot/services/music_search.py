@@ -9,7 +9,8 @@ from typing import Optional
 from bot.config import settings
 from bot.logger import logger
 from bot.services.downloader import (
-    build_base_opts, format_selector, open_ydl, resolve_output_path, run_ydl, strip_media_ext,
+    apply_proxy, build_base_opts, format_selector, open_ydl, resolve_output_path, run_ydl,
+    strip_media_ext,
 )
 
 # Results longer than this (mixes, full albums) are flagged in the result list.
@@ -89,6 +90,7 @@ def _parse_entry(entry: dict) -> Optional[SongEntry]:
 
 def _search_sync(query: str, max_results: int) -> list[dict]:
     opts = build_base_opts(extract_flat=True, skip_download=True, noplaylist=False)
+    apply_proxy(opts, "https://www.youtube.com/")
     with open_ydl(opts) as ydl:
         result = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
     return list(result.get("entries") or [])

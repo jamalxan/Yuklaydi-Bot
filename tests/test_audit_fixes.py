@@ -1583,3 +1583,45 @@ def test_instagram_http_400_means_post_is_gone():
     assert classify_download_error(err).kind == "private"
     other = yt_dlp.utils.DownloadError("ERROR: [youtube] x: HTTP Error 400: Bad Request")
     assert classify_download_error(other).kind == "generic"
+
+
+# ── per-platform proxy ───────────────────────────────────────────────────────
+# TikTok is blocked at ISP level where the bot runs (TLS handshakes to
+# www.tiktok.com time out, the v16/v19 video CDNs never connect), so TikTok
+# traffic can be routed through a proxy while YouTube/Instagram stay direct.
+
+class _ProxyYDL(_FakeYDL):
+    seen: list = []
+
+    def process_ie_result(self, info, download=True):
+        _ProxyYDL.seen.append(self.opts.get("proxy"))
+        return info
+
+
+@pytest.mark.parametrize("platforms, url, expected", [
+    ("tiktok", "https://www.tiktok.com/@u/video/1", "socks5://proxy:1080"),
+    ("tiktok", "https://vm.tiktok.com/ZMabc/", "socks5://proxy:1080"),
+    ("tiktok", "https://www.youtube.com/watch?v=abc", None),
+    ("tiktok, instagram", "https://www.instagram.com/reel/abc/", "socks5://proxy:1080"),
+    ("all", "https://www.youtube.com/watch?v=abc", "socks5://proxy:1080"),
+])
+def test_proxy_applied_only_to_configured_platforms(platforms, url, expected):
+    from bot.config import settings
+    from bot.services import downloader as d
+    _ProxyYDL.seen = []
+    with patch.object(settings, "proxy_url", "socks5://proxy:1080"), \
+         patch.object(settings, "proxy_platforms", platforms), \
+         patch("yt_dlp.YoutubeDL", _ProxyYDL):
+        d.run_ydl(url, d.build_base_opts(outtmpl="/t/px.mp4"), "720")
+    assert _ProxyYDL.seen == [expected]
+
+
+def test_no_proxy_url_means_direct_everywhere():
+    from bot.config import settings
+    from bot.services import downloader as d
+    _ProxyYDL.seen = []
+    with patch.object(settings, "proxy_url", ""), patch.object(settings, "proxy_platforms", "all"), \
+         patch("yt_dlp.YoutubeDL", _ProxyYDL):
+        d.run_ydl("https://www.tiktok.com/@u/video/1", d.build_base_opts(outtmpl="/t/px2.mp4"), "720")
+    assert _ProxyYDL.seen == [None]
+    assert d.proxy_for("https://www.tiktok.com/@u/video/1") is None
