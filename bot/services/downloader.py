@@ -273,7 +273,7 @@ def classify_download_error(exc: BaseException) -> "DownloadError":
         return DownloadError(str(exc), kind="no_video")
     elif "sign in" in msg or "login" in msg or "log in" in msg:
         return DownloadError(str(exc), kind="no_video")
-    elif "unsupported url" in msg or "no suitable infoextractor" in msg:
+    elif "unsupported url" in msg or "no suitable extractor" in msg or "no suitable infoextractor" in msg:
         return DownloadError(str(exc), kind="unsupported")
     else:
         return DownloadError(str(exc), kind="generic")
@@ -365,10 +365,13 @@ def _apply_cookies(opts: dict) -> None:
         opts["cookiesfrombrowser"] = (settings.cookies_from_browser,)
 
 
+_MEDIA_EXTS = (".mp4", ".mp3", ".m4a", ".webm", ".opus", ".ogg", ".mkv")
+
+
 def strip_media_ext(path: str) -> str:
-    """Drop a trailing .mp4/.mp3 (yt-dlp appends the real extension itself)."""
+    """Drop a trailing media extension (yt-dlp appends the real one itself)."""
     root, ext = os.path.splitext(path)
-    return root if ext.lower() in (".mp4", ".mp3") else path
+    return root if ext.lower() in _MEDIA_EXTS else path
 
 
 # ── Size / duration limits (checked before any byte is downloaded) ───────────

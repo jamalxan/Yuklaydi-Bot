@@ -833,3 +833,23 @@ def test_pgbouncer_connect_args():
     assert args["statement_cache_size"] == 0
     assert args["prepared_statement_cache_size"] == 0
     assert callable(args["prepared_statement_name_func"])
+
+
+# ── Found during live yt-dlp run ─────────────────────────────────────────────
+
+def test_no_suitable_extractor_is_unsupported():
+    from bot.services.downloader import classify_download_error
+    err = Exception("ERROR: No suitable extractor found for URL http://127.0.0.1:8081/x")
+    assert classify_download_error(err).kind == "unsupported"
+
+
+@pytest.mark.parametrize("path,expected", [
+    ("/t/shz_a_clip.m4a", "/t/shz_a_clip"),
+    ("/t/ydl_a.mp4", "/t/ydl_a"),
+    ("/t/mus_a.mp3", "/t/mus_a"),
+    ("/t/x.webm", "/t/x"),
+    ("/t/x.txt", "/t/x.txt"),
+])
+def test_strip_media_ext(path, expected):
+    from bot.services.downloader import strip_media_ext
+    assert strip_media_ext(path) == expected
