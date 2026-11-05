@@ -100,7 +100,8 @@ async def check_postgres() -> None:
         async with engine.connect() as conn:
             row = await conn.execute(text("SELECT current_database(), version()"))
             fetched = row.fetchone()
-            assert fetched is not None
+            if fetched is None:
+                raise RuntimeError("SELECT returned no row")
             db_name, ver = fetched
             ok("Postgres reachable", f"db={db_name}")
             ok("Postgres version", ver.split(",")[0])

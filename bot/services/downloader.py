@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlsplit, urlun
 import yt_dlp
 
 from bot.config import settings
+from bot.logger import logger
 
 # ── Platform detection ────────────────────────────────────────────────────────
 #
@@ -210,10 +211,15 @@ def _format_selector(quality: str, max_bytes: Optional[int] = None) -> str:
     h = 1080 if quality in ("1080", "1080p") else 720
     f = _size_filter(max_bytes)
     return (
-        f"b[protocol!*=m3u8][ext=mp4][height<={h}]{f}/b[protocol!*=m3u8][height<={h}]{f}"
-        f"/bv*[protocol!*=m3u8][height<={h}]{f}+ba[protocol!*=m3u8]"
-        f"/b[ext=mp4][height<={h}]{f}/b[height<={h}]{f}"
-        f"/bv*[height<={h}]{f}+ba[ext=m4a]/bv*[height<={h}]{f}+ba/b{f}/best"
+        # 1) Separate video+audio over plain https (DASH): the only way to get
+        #    real 720p/1080p from YouTube — its combined mp4 tops out at 360p.
+        #    Merged with "-c copy", no transcode; m4a audio first for mp4.
+        f"bv[protocol!*=m3u8][height<={h}]{f}+ba[protocol!*=m3u8][ext=m4a]"
+        f"/bv[protocol!*=m3u8][height<={h}]{f}+ba[protocol!*=m3u8]"
+        # 2) Combined https file (TikTok, Instagram, Facebook, X usually).
+        f"/b[protocol!*=m3u8][ext=mp4][height<={h}]{f}/b[protocol!*=m3u8][height<={h}]{f}"
+        # 3) HLS only as a last resort (throttled hosts), then anything.
+        f"/bv[height<={h}]{f}+ba/b[height<={h}]{f}/b{f}/best"
     )
 
 
@@ -245,9 +251,20 @@ def has_cookies() -> bool:
     return bool(cookies_path() or settings.cookies_from_browser)
 
 
-def youtube_extractor_args() -> dict:
-    # Multiple clients: if one gets bot-checked, yt-dlp tries the next.
-    return {"youtube": {"player_client": ["android", "web_safari", "web"]}}
+YOUTUBE_PRIMARY_CLIENTS = ("default",)
+# Retry set when the primary client's stream URLs answer 403 (PO-token /
+# SABR-gated videos). Lower quality (android tops out at 360p) but it works.
+YOUTUBE_FALLBACK_CLIENTS = ("android", "web_safari", "web")
+
+
+def youtube_extractor_args(clients: tuple[str, ...] = YOUTUBE_PRIMARY_CLIENTS) -> dict:
+    # yt-dlp's own "default" client set (kept current by yt-dlp releases).
+    # The old hard-coded ["android", "web_safari", "web"] list starved format
+    # selection: web/web_safari returned no formats without a PO token and
+    # android only offered 360p, so every "720p"/"1080p" download was 360p.
+    # Measured on one 635 s video: default → 33 formats (https up to 2160p),
+    # old list → 5 formats (max 360p).
+    return {"youtube": {"player_client": list(clients)}}
 
 
 def classify_download_error(exc: BaseException) -> "DownloadError":
@@ -454,35 +471,90 @@ def resolve_output_path(info: Optional[dict], expected: str) -> str:
 
 # ── Sync download (runs in a worker thread) ──────────────────────────────────
 
-def _download_sync(url: str, output_path: str, quality: str) -> DownloadResult:
-    opts = _build_opts(output_path, quality)
-    t_start = time.monotonic()
+# Stream-fetch failures worth one retry with other YouTube clients. A 403
+# reaches us verbatim from yt-dlp's own downloader, but when ffmpeg does the
+# fetching (download_ranges clips, HLS) only its exit status survives.
+_RETRYABLE_MARKERS = ("http error 403", "ffmpeg exited with code", "unable to download video data")
 
+
+def _is_forbidden(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(m in msg for m in _RETRYABLE_MARKERS)
+
+
+def _remove_partials(outtmpl) -> None:
+    """Delete .part/.ytdl leftovers of a failed attempt before retrying.
+
+    A retry may pick a different format; letting yt-dlp "resume" a stale
+    .part from another format would corrupt the output. yt-dlp rewrites
+    ``opts["outtmpl"]`` in place into a dict, so both forms are accepted.
+    """
+    if isinstance(outtmpl, dict):
+        outtmpl = outtmpl.get("default") or ""
+    outtmpl = str(outtmpl or "")
+    if not outtmpl:
+        return
+    base = outtmpl.split("%(", 1)[0]
+    base = strip_media_ext(base) if "%(" not in outtmpl else base.rstrip(".")
+    folder, prefix = os.path.split(base)
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            # Pass 1: metadata + format selection only, so oversized/overlong
-            # media is rejected before a single media byte is downloaded.
-            info = ydl.extract_info(url, download=False)
-            if not isinstance(info, dict):
-                raise DownloadError("No media info", kind="generic")
-            check_limits(info, quality)
-            t_extract = time.monotonic() - t_start
+        for name in os.listdir(folder or "."):
+            if name.startswith(prefix) and _is_junk(name):
+                try:
+                    os.remove(os.path.join(folder, name))
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
-            # Pass 2: download the already-resolved info dict (no re-extract).
-            t_dl = time.monotonic()
-            processed = ydl.process_ie_result(info, download=True)
-            info = processed if isinstance(processed, dict) else info
-            t_download = time.monotonic() - t_dl
 
-        expected = (strip_media_ext(output_path) + ".mp3") if quality == "mp3" else output_path
-        out = resolve_output_path(info, expected)
-        size = os.path.getsize(out) if os.path.isfile(out) else 0
-        if size > settings.max_file_bytes:
-            raise DownloadError("Too large", kind="too_large")
-        return DownloadResult(out, t_extract, t_download, size)
+def run_ydl(url: str, opts: dict, quality: Optional[str] = None) -> tuple[dict, float, float]:
+    """Two-pass yt-dlp run shared by every download path.
 
-    except yt_dlp.utils.DownloadError as e:
-        raise classify_download_error(e) from e
+    Pass 1 extracts metadata and selects formats; ``check_limits`` (when
+    *quality* is given) rejects oversized/overlong media before any byte is
+    fetched. Pass 2 downloads the resolved info dict without re-extracting.
+    On a YouTube 403 the whole run is retried once with the fallback clients.
+    Returns (info, t_extract, t_download); raises DownloadError.
+    """
+    attempts = [opts]
+    if platform_for_host(safe_hostname(url) or "") == "youtube":
+        fallback = dict(opts)
+        fallback["extractor_args"] = youtube_extractor_args(YOUTUBE_FALLBACK_CLIENTS)
+        attempts.append(fallback)
+
+    for i, o in enumerate(attempts):
+        t0 = time.monotonic()
+        try:
+            with yt_dlp.YoutubeDL(o) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if not isinstance(info, dict):
+                    raise DownloadError("No media info", kind="generic")
+                if quality:
+                    check_limits(info, quality)
+                t_extract = time.monotonic() - t0
+                t1 = time.monotonic()
+                processed = ydl.process_ie_result(info, download=True)
+                return (processed if isinstance(processed, dict) else info,
+                        t_extract, time.monotonic() - t1)
+        except yt_dlp.utils.DownloadError as e:
+            if i + 1 < len(attempts) and _is_forbidden(e):
+                logger.warning(f"YouTube 403 with {o['extractor_args']['youtube']['player_client']}; "
+                               f"retrying with fallback clients: {url}")
+                _remove_partials(o.get("outtmpl"))
+                continue
+            raise classify_download_error(e) from e
+    raise DownloadError("unreachable", kind="generic")  # pragma: no cover
+
+
+def _download_sync(url: str, output_path: str, quality: str) -> DownloadResult:
+    info, t_extract, t_download = run_ydl(url, _build_opts(output_path, quality), quality)
+    expected = (strip_media_ext(output_path) + ".mp3") if quality == "mp3" else output_path
+    out = resolve_output_path(info, expected)
+    size = os.path.getsize(out) if os.path.isfile(out) else 0
+    if size > settings.max_file_bytes:
+        raise DownloadError("Too large", kind="too_large")
+    return DownloadResult(out, t_extract, t_download, size)
 
 
 async def download(url: str, output_path: str, quality: str = "720") -> DownloadResult:
@@ -512,12 +584,8 @@ def _download_audio_clip_sync(url: str, output_path: str) -> str:
         force_keyframes_at_cuts=False,
         writethumbnail=False,
     )
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-    except yt_dlp.utils.DownloadError as e:
-        raise classify_download_error(e) from e
-    return resolve_output_path(info if isinstance(info, dict) else None, output_path)
+    info, _, _ = run_ydl(url, opts)
+    return resolve_output_path(info, output_path)
 
 
 async def download_audio_clip(url: str, output_path: str) -> str:

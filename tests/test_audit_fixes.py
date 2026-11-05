@@ -1030,3 +1030,99 @@ def test_video_opts_prefer_h264_aac_but_mp3_untouched():
     from bot.services.downloader import _build_opts
     assert _build_opts("/t/x.mp4", "720")["format_sort"] == ["res", "vcodec:h264", "acodec:aac"]
     assert "format_sort" not in _build_opts("/t/x.mp3", "mp3")
+
+
+# ── YouTube quality + 403 client fallback (found in live runs) ──────────────
+
+def test_youtube_uses_default_client_first():
+    from bot.services.downloader import build_base_opts
+    assert build_base_opts()["extractor_args"]["youtube"]["player_client"] == ["default"]
+
+
+def test_video_selector_prefers_separate_https_streams_for_hd():
+    from bot.services.downloader import _format_selector
+    sel = _format_selector("720", None)
+    first = sel.split("/")[0]
+    assert first.startswith("bv[protocol!*=m3u8][height<=720]") and "+ba" in first, \
+        "YouTube's combined mp4 tops out at 360p: DASH video+audio must be tried first"
+    assert "[height<=1080]" in _format_selector("1080", None).split("/")[0]
+
+
+class _FakeYDL:
+    """Records the player_client of each attempt; first one 403s."""
+    calls: list = []
+
+    def __init__(self, opts):
+        self.opts = opts
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def extract_info(self, url, download=False):
+        return {"duration": 10, "filesize": 1000, "requested_downloads": []}
+
+    def process_ie_result(self, info, download=True):
+        import yt_dlp
+        clients = self.opts["extractor_args"]["youtube"]["player_client"]
+        _FakeYDL.calls.append(clients)
+        if clients == ["default"]:
+            raise yt_dlp.utils.DownloadError("ERROR: unable to download video data: HTTP Error 403: Forbidden")
+        return info
+
+
+def test_run_ydl_retries_youtube_403_with_fallback_clients(tmp_path):
+    from bot.services import downloader as d
+    _FakeYDL.calls = []
+    part = tmp_path / "ydl_x.f247.webm.part"
+    part.write_bytes(b"stale")
+    opts = d.build_base_opts(outtmpl=str(tmp_path / "ydl_x.mp4"))
+    with patch("yt_dlp.YoutubeDL", _FakeYDL):
+        info, _, _ = d.run_ydl("https://www.youtube.com/watch?v=abc", opts, "720")
+    assert _FakeYDL.calls == [["default"], list(d.YOUTUBE_FALLBACK_CLIENTS)]
+    assert not part.exists(), "stale .part from the failed attempt must be removed"
+
+
+def test_run_ydl_does_not_retry_non_youtube_or_non_403():
+    import yt_dlp
+    from bot.services import downloader as d
+    _FakeYDL.calls = []
+    with patch("yt_dlp.YoutubeDL", _FakeYDL), pytest.raises(d.DownloadError):
+        d.run_ydl("https://www.tiktok.com/@u/video/1", d.build_base_opts(outtmpl="/t/ydl_y.mp4"), "720")
+    assert _FakeYDL.calls == [["default"]]
+
+    class _Unavailable(_FakeYDL):
+        def process_ie_result(self, info, download=True):
+            _FakeYDL.calls.append("x")
+            raise yt_dlp.utils.DownloadError("ERROR: Video unavailable")
+
+    _FakeYDL.calls = []
+    with patch("yt_dlp.YoutubeDL", _Unavailable), pytest.raises(d.DownloadError):
+        d.run_ydl("https://www.youtube.com/watch?v=abc", d.build_base_opts(outtmpl="/t/ydl_z.mp4"))
+    assert _FakeYDL.calls == ["x"], "a non-retryable error must not trigger a second attempt"
+
+
+def test_run_ydl_checks_limits_before_download():
+    from bot.config import settings
+    from bot.services import downloader as d
+
+    class _Huge(_FakeYDL):
+        def extract_info(self, url, download=False):
+            return {"duration": settings.max_audio_duration + 10}
+
+    _FakeYDL.calls = []
+    with patch("yt_dlp.YoutubeDL", _Huge), pytest.raises(d.DownloadError) as ei:
+        d.run_ydl("https://www.youtube.com/watch?v=abc", d.build_base_opts(outtmpl="/t/m.mp3"), "mp3")
+    assert ei.value.kind == "too_long" and _FakeYDL.calls == []
+
+
+def test_remove_partials_accepts_ytdlp_rewritten_dict(tmp_path):
+    from bot.services.downloader import _remove_partials
+    (tmp_path / "shz_a.f251.webm.part").write_bytes(b"x")
+    (tmp_path / "shz_a.m4a").write_bytes(b"keep")
+    (tmp_path / "shz_other.part").write_bytes(b"other job")
+    _remove_partials({"default": str(tmp_path / "shz_a.%(ext)s"), "chapter": "x"})
+    left = {p.name for p in tmp_path.iterdir()}
+    assert left == {"shz_a.m4a", "shz_other.part"}

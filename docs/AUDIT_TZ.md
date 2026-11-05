@@ -764,3 +764,78 @@ Har bir bosqich oxirida: `pytest` to'liq yashil, `scripts/e2e_live_test.py` real
 3. Musiqa uchun maksimal davomiylik qancha bo'lsin — 20 daqiqa mos keladimi? (BUG-09)
 4. Production'da Local Bot API ishlatiladimi (2 GB) yoki cloud API (50 MB)? `MAX_FILE_MB` shunga qarab belgilanadi. (BUG-08)
 5. `daily_stats` jadvali kelajakda grafiklar uchun kerakmi yoki olib tashlansinmi? (BUG-12)
+
+---
+
+## 8. Bajarilish holati (2026-11-05)
+
+Barcha 32 ta topilma yopildi. Har biri uchun regression test bor
+(`tests/test_audit_fixes.py`, TZ §4'dagi 16 ta majburiy test shu faylda).
+Offlayn to'plam: `pytest -m "not network"` — **yashil**.
+
+| ID | Holat | Qanday yopildi |
+|---|---|---|
+| BUG-01 | ✅ | Hostname bo'yicha domen chegarasi; IP, userinfo, nostandart port rad etiladi; yt-dlp `allowed_extractors` (generic yo'q); qisqa havolalarning har bir redirect'i tekshiriladi |
+| BUG-02 | ✅ | Redis ban to'plami + `dp.update` outer `BanMiddleware`; admin hech qachon bloklanmaydi; Redis ishlamasa fail-open |
+| BUG-03 | ✅ | `cleanup_task` arq cron (30 daqiqa, `unique`); faqat `DOWNLOAD_DIR/tmp` va prefiksli fayllar; cookie `./secrets/`da |
+| BUG-04 | ✅ | Birinchi xabardayoq upsert (soatiga 1 marta, `useen:` belgisi); `lang_chosen` ustuni |
+| BUG-05 | ✅ | Slot navbatga qo'yishda atomar (Lua) band qilinadi; callback debounce + rate limit |
+| BUG-06 | ✅ | `esc()` barcha tashqi matnlarda; lyrics ≤ 4096 belgi; song card havolalari faqat `https` |
+| BUG-07 | ✅ | `message.html_text`; preview yuborilmasa saqlanmaydi; `/start` xato bo'lsa standart matn |
+| BUG-08 | ✅ | Ikki bosqichli yt-dlp: metadata → `check_limits` → yuklash; `max_filesize`; cloud API'da 50 MB clamp |
+| BUG-09 | ✅ | MP3 ≤ `MAX_AUDIO_DURATION` (20 daqiqa) yuklashdan oldin tekshiriladi; ro'yxatda uzun treklar belgilanadi |
+| BUG-10 | ✅ | Broadcast arq worker'da, Redis'da progress, qayta ishga tushsa davom etadi; `RetryAfter` o'sha userga qayta; bloklaganlar `is_blocked_bot` |
+| BUG-11 | ✅ | Parollar faqat env'dan; prod'da `POSTGRES_PASSWORD`/`REDIS_PASSWORD` majburiy; `REDIS_URL`ga parol avtomatik qo'shiladi |
+| BUG-12 | ✅ | Statistika event jadvallaridan, `Asia/Tashkent` kun chegarasi, kesh hitlari `from_cache=True` bilan sanaladi; `daily_stats` yozilmaydi |
+| BUG-13 | ✅ | Throttling tilni Redis'dan oladi |
+| BUG-14 | ✅ | `_user_job`: `asyncio.timeout` + `CancelledError` → progress xabari xato matniga almashtiriladi |
+| BUG-15 | ✅ | Kanal tekshiruvi callback'larda ham; tasdiq lokalizatsiya qilingan; **admin hech qachon bloklanmaydi** |
+| BUG-16 | ✅ | Faqat `audio/*`, `video/*` hujjatlar; cloud API'da > 20 MB uchun oldindan xabar; 90 s audio klip zaxirasi |
+| BUG-17 | ✅ | Qidiruv keshi o'qiladi; qidiruv cheklangan thread pool'da |
+| BUG-18 | ✅ | `parse_user_id`/`parse_channel_ref` `None`ga chidamli; noto'g'ri kiritishda holat saqlanadi |
+| BUG-19 | ✅ | Kanal saqlashdan oldin bot admin ekanligi tekshiriladi |
+| BUG-20 | ✅ | `ucap` TTL = `job_timeout + 60`; single-flight kutish lock yo'qolguncha |
+| BUG-21 | ✅ | Global xato foydalanuvchi tilida; `JsonFormatter` — har satr yaroqli JSON |
+| BUG-22 | ✅ | Barcha matnlar `bot/texts.py`da (uz/ru/en), kalitlar to'liqligi test bilan |
+| BUG-23 | ✅ | `INSERT … ON CONFLICT … RETURNING (xmax = 0)` |
+| BUG-24 | ✅ | `safe_delete` bloklamaydi; `safe_delete_async` |
+| BUG-25 | ✅ | Hamma yt-dlp chaqiruvlari `build_base_opts` + umumiy `run_ydl` orqali |
+| BUG-26 | ✅ | `recognition_windows` takrorlarni olib tashlaydi; ≤ 15 s klip — bitta so'rov |
+| BUG-27 | ✅ | Ban, throttling, til, kanal — Redis xatosida fail-open; til keshi qayta to'ldiriladi |
+| BUG-28 | ✅ | Barcha router'lar `ChatType.PRIVATE` |
+| BUG-29 | ✅ | Konteyner `app` (uid 10001) foydalanuvchisida; 8081 faqat `127.0.0.1`; PgBouncer healthcheck haqiqiy |
+| BUG-30 | ✅ | `reply.py`, `.ftl`, ishlatilmagan paketlar olib tashlandi; test kutubxonalari `requirements-dev.txt`da |
+| BUG-31 | ✅ | `assert`lar, `get_event_loop()`, `utcnow()` almashtirildi |
+| BUG-32 | ✅ | Alembic yagona sxema vositasi; idempotent baseline; startup'da `upgrade head` |
+
+### Audit davomida qo'shimcha topilgan va tuzatilganlar
+
+- **YouTube "720p/1080p" aslida 360p edi.** Qattiq yozilgan `player_client`
+  ro'yxati (`android, web_safari, web`) PO token'siz faqat 360p formatini
+  berardi. Endi yt-dlp'ning `default` klienti + DASH (alohida video+audio,
+  `-c copy`) birinchi; YouTube 403 qaytarsa bir marta eski klientlar bilan
+  qayta uriniladi (`run_ydl`), eski urinishning `.part` fayllari o'chiriladi.
+- Bloklangan URL "generic" emas, "unsupported" deb ko'rsatiladi; klip fayli
+  ikki kengaytmali (`.m4a.mp4`) bo'lib qolmaydi.
+- AudD.io zaxirasi (faqat `AUDD_TOKEN` bilan), Spotify tugmasi; bitta xabarda
+  5 tagacha havola (har biri per-user limitga kiradi); h264/aac afzal.
+
+### Jonli tekshirilgan
+
+- Haqiqiy Redis: Lua slot (50 parallel so'rov → aynan 3), ban, debounce, lock'lar.
+- Haqiqiy Postgres: `upgrade`/`downgrade`/`upgrade`, eski `create_all` bazasidan
+  o'tish, upsert, keyset sahifalash, export, statistika.
+- Haqiqiy YouTube: 720p/1080p (h264+aac), MP3, 90 s klip, qidiruv, musiqa,
+  403 zaxirasi, 6 soatlik trek rad etilishi, thumbnail, SSRF bloki.
+
+### Hali tekshirilmagan
+
+- Docker image build va entrypoint (`setpriv`), PgBouncer orqali ulanish.
+- Telegram'da jonli bot va broadcast (ikkinchi polling nusxasi xavfi sababli).
+- TikTok (lokal tarmoqda bloklangan), Instagram (cookie kerak).
+
+### Mas'ul shaxs qarorlari (§7) — qabul qilingan standartlar
+
+1. Bot faqat private chat. 2. `Asia/Tashkent`. 3. 20 daqiqa. 4. `LOCAL_API_URL`
+bo'lsa 2000 MB, bo'lmasa 50 MB (avtomatik). 5. `daily_stats` saqlanadi, lekin
+yozilmaydi — o'chirish alohida migratsiya bilan.

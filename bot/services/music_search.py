@@ -11,8 +11,8 @@ import yt_dlp
 from bot.config import settings
 from bot.logger import logger
 from bot.services.downloader import (
-    DownloadError, build_base_opts, check_limits, classify_download_error,
-    format_selector, resolve_output_path, strip_media_ext,
+    build_base_opts,
+    format_selector, resolve_output_path, run_ydl, strip_media_ext,
 )
 
 # Results longer than this (mixes, full albums) are flagged in the result list.
@@ -124,16 +124,9 @@ def _download_audio_sync(url: str, output_path: str) -> str:
             "preferredquality": "192",
         }],
     )
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not isinstance(info, dict):
-                raise DownloadError("No media info", kind="generic")
-            check_limits(info, "mp3")  # duration/size cap before downloading
-            processed = ydl.process_ie_result(info, download=True)
-            info = processed if isinstance(processed, dict) else info
-    except yt_dlp.utils.DownloadError as e:
-        raise classify_download_error(e) from e
+    # Same two-pass runner as video: limits checked before download, and a
+    # YouTube 403 retries once with the fallback clients.
+    info, _, _ = run_ydl(url, opts, "mp3")
     # Return the file yt-dlp really wrote (post-processor output), not a guess.
     return resolve_output_path(info, strip_media_ext(output_path) + ".mp3")
 

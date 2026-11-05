@@ -108,7 +108,7 @@ async def _search_genius(title: str, artist: str) -> Optional[str]:
         except Exception:
             pass
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         song = await loop.run_in_executor(
             None,
             lambda: genius.search_song(title, artist, get_full_info=False),
